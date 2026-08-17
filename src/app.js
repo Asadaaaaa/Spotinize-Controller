@@ -12,6 +12,7 @@ import playlistRoutes from './routes/playlistRoutes.js';
 import spotifyRoutes from './routes/spotifyRoutes.js';
 import audioRoutes from './routes/audioRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
+import deployRoutes from './routes/deployRoutes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -49,6 +50,7 @@ export class App {
     this.app.use('/api/spotify', spotifyRoutes);
     this.app.use('/api/audio', audioRoutes);
     this.app.use('/api/notifications', notificationRoutes);
+    this.app.use('/api/deploy', deployRoutes);
 
     // 404 handler
     this.app.use((req, res) => {
