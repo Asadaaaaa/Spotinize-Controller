@@ -1,0 +1,39 @@
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Local SQLite Database
+database.sqlite
+database.sqlite-journal
+database.sqlite-shm
+database.sqlite-wal
+*.db
+
+# Audio & Image Cache
+audio_cache/
+image_cache/
+*.mp3
+*.m4a
+*.temp
+*.jpg
+*.jpeg
+*.png
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS & IDE
+.DS_Store
+.vscode
+.idea

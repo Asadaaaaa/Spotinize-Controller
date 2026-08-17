@@ -1,0 +1,59 @@
+import { DataTypes, Model } from 'sequelize';
+import { sequelize } from '../config/database.js';
+
+export class Track extends Model {}
+
+Track.init({
+  id: {
+    type: DataTypes.UUID,
+    defaultValue: DataTypes.UUIDV4,
+    primaryKey: true
+  },
+  spotifyId: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    unique: true
+  },
+  title: {
+    type: DataTypes.STRING,
+    allowNull: false
+  },
+  artist: {
+    type: DataTypes.STRING,
+    allowNull: false
+  },
+  album: {
+    type: DataTypes.STRING,
+    allowNull: true
+  },
+  albumArt: {
+    type: DataTypes.STRING,
+    allowNull: true
+  },
+  previewUrl: {
+    type: DataTypes.STRING,
+    allowNull: true
+  },
+  localAudioPath: {
+    type: DataTypes.STRING,
+    allowNull: true
+  },
+  category: {
+    type: DataTypes.STRING,
+    allowNull: true
+  },
+  durationMs: {
+    type: DataTypes.INTEGER,
+    defaultValue: 30000
+  },
+  popularity: {
+    type: DataTypes.INTEGER,
+    defaultValue: 50
+  }
+}, {
+  sequelize,
+  modelName: 'Track',
+  tableName: 'tracks'
+});
+
+export default Track;
