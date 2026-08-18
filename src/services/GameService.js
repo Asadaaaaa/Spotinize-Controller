@@ -26,7 +26,15 @@ export class GameService {
    * Creates a Solo Game Session
    */
   async createSoloGame(userId, { category = 'Global Trends', artistQuery = null, numberOfSongs = 5 }) {
-    const rawTracks = await spotifyService.getTopTracks(category, artistQuery);
+    let rawTracks = [];
+    if (category === 'My Songs') {
+      rawTracks = await spotifyService.getUserPersonalTracks(userId);
+      if (!rawTracks || rawTracks.length === 0) {
+        throw new Error('Tidak dapat memuat lagu dari Spotify kamu. Pastikan akun Spotify kamu sudah terhubung di menu profil!');
+      }
+    } else {
+      rawTracks = await spotifyService.getTopTracks(category, artistQuery);
+    }
     
     // Filter recently played tracks within 24h
     const eligibleTracks = await recentlyPlayedService.filterEligibleTracks(
@@ -103,7 +111,15 @@ export class GameService {
       throw new Error('Semua pemain harus siap (Ready) sebelum game dapat dimulai!');
     }
 
-    const rawTracks = await spotifyService.getTopTracks(game.category, game.artistQuery);
+    let rawTracks = [];
+    if (game.category === 'My Songs') {
+      rawTracks = await spotifyService.getUserPersonalTracks(hostUserId);
+      if (!rawTracks || rawTracks.length === 0) {
+        throw new Error('Tidak dapat memuat lagu dari Spotify Host. Pastikan Host sudah menghubungkan akun Spotify di profil!');
+      }
+    } else {
+      rawTracks = await spotifyService.getTopTracks(game.category, game.artistQuery);
+    }
 
     const eligibleTracks = await recentlyPlayedService.filterEligibleTracks(
       rawTracks,

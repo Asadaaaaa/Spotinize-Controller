@@ -257,6 +257,209 @@ export class SpotifyService {
   }
 
   /**
+   * Fetches personalized tracks for a specific user from their connected Spotify account:
+   * 1. Top Tracks (short_term & medium_term)
+   * 2. Saved / Liked Tracks (/me/tracks)
+   * 3. Recently Played Tracks (/me/player/recently-played)
+   * 4. User's Playlists Tracks (/me/playlists)
+   */
+  async getUserPersonalTracks(userId) {
+    if (!userId) return [];
+
+    let user = null;
+    try {
+      const { UserRepository } = await import('../repositories/UserRepository.js');
+      const userRepo = new UserRepository();
+      user = await userRepo.findById(userId);
+    } catch (e) {
+      console.warn('[SpotifyService] Could not fetch user repository:', e.message);
+    }
+
+    if (!user || !user.spotifyConnected || !user.accessToken) {
+      console.warn(`[SpotifyService] User ${userId} has not connected Spotify account.`);
+      return [];
+    }
+
+    let token = user.accessToken;
+    let refreshToken = user.refreshToken;
+
+    const fetchWithToken = async (activeToken) => {
+      const tracksMap = new Map();
+
+      // 1. Fetch Top Tracks (short_term & medium_term)
+      for (const timeRange of ['short_term', 'medium_term']) {
+        try {
+          const res = await axios.get('https://api.spotify.com/v1/me/top/tracks', {
+            params: { limit: 50, time_range: timeRange },
+            headers: { Authorization: `Bearer ${activeToken}` },
+            timeout: 6000
+          });
+          if (res.data?.items) {
+            for (const item of res.data.items) {
+              if (item?.name && item?.id && !tracksMap.has(item.id)) {
+                tracksMap.set(item.id, {
+                  spotifyId: item.id,
+                  title: item.name,
+                  artist: item.artists?.map(a => a.name).join(', ') || 'Unknown',
+                  primaryArtist: item.artists?.[0]?.name || '',
+                  album: item.album?.name || '',
+                  albumArt: item.album?.images?.[0]?.url || item.album?.images?.[1]?.url || null,
+                  previewUrl: item.preview_url || null,
+                  durationMs: item.duration_ms || 30000,
+                  category: 'My Songs'
+                });
+              }
+            }
+          }
+        } catch (e) {
+          if (e.response?.status === 401) throw e;
+          console.warn(`[SpotifyService] Top tracks (${timeRange}) notice:`, e.message);
+        }
+      }
+
+      // 2. Fetch User's Liked / Saved Tracks (/me/tracks)
+      try {
+        const res = await axios.get('https://api.spotify.com/v1/me/tracks', {
+          params: { limit: 50 },
+          headers: { Authorization: `Bearer ${activeToken}` },
+          timeout: 6000
+        });
+        if (res.data?.items) {
+          for (const item of res.data.items) {
+            const trk = item.track;
+            if (trk?.name && trk?.id && !tracksMap.has(trk.id)) {
+              tracksMap.set(trk.id, {
+                spotifyId: trk.id,
+                title: trk.name,
+                artist: trk.artists?.map(a => a.name).join(', ') || 'Unknown',
+                primaryArtist: trk.artists?.[0]?.name || '',
+                album: trk.album?.name || '',
+                albumArt: trk.album?.images?.[0]?.url || trk.album?.images?.[1]?.url || null,
+                previewUrl: trk.preview_url || null,
+                durationMs: trk.duration_ms || 30000,
+                category: 'My Songs'
+              });
+            }
+          }
+        }
+      } catch (e) {
+        if (e.response?.status === 401) throw e;
+        console.warn('[SpotifyService] Saved tracks notice:', e.message);
+      }
+
+      // 3. Fetch Recently Played Tracks (/me/player/recently-played)
+      try {
+        const res = await axios.get('https://api.spotify.com/v1/me/player/recently-played', {
+          params: { limit: 50 },
+          headers: { Authorization: `Bearer ${activeToken}` },
+          timeout: 6000
+        });
+        if (res.data?.items) {
+          for (const item of res.data.items) {
+            const trk = item.track;
+            if (trk?.name && trk?.id && !tracksMap.has(trk.id)) {
+              tracksMap.set(trk.id, {
+                spotifyId: trk.id,
+                title: trk.name,
+                artist: trk.artists?.map(a => a.name).join(', ') || 'Unknown',
+                primaryArtist: trk.artists?.[0]?.name || '',
+                album: trk.album?.name || '',
+                albumArt: trk.album?.images?.[0]?.url || trk.album?.images?.[1]?.url || null,
+                previewUrl: trk.preview_url || null,
+                durationMs: trk.duration_ms || 30000,
+                category: 'My Songs'
+              });
+            }
+          }
+        }
+      } catch (e) {
+        if (e.response?.status === 401) throw e;
+        console.warn('[SpotifyService] Recently played notice:', e.message);
+      }
+
+      // 4. Fetch User's Playlists Tracks (/me/playlists)
+      try {
+        const pRes = await axios.get('https://api.spotify.com/v1/me/playlists', {
+          params: { limit: 10 },
+          headers: { Authorization: `Bearer ${activeToken}` },
+          timeout: 6000
+        });
+        if (pRes.data?.items) {
+          for (const pl of pRes.data.items.slice(0, 5)) {
+            try {
+              const trkRes = await axios.get(`https://api.spotify.com/v1/playlists/${pl.id}/tracks`, {
+                params: { limit: 30 },
+                headers: { Authorization: `Bearer ${activeToken}` },
+                timeout: 5000
+              });
+              if (trkRes.data?.items) {
+                for (const item of trkRes.data.items) {
+                  const trk = item.track;
+                  if (trk?.name && trk?.id && !tracksMap.has(trk.id)) {
+                    tracksMap.set(trk.id, {
+                      spotifyId: trk.id,
+                      title: trk.name,
+                      artist: trk.artists?.map(a => a.name).join(', ') || 'Unknown',
+                      primaryArtist: trk.artists?.[0]?.name || '',
+                      album: trk.album?.name || '',
+                      albumArt: trk.album?.images?.[0]?.url || trk.album?.images?.[1]?.url || null,
+                      previewUrl: trk.preview_url || null,
+                      durationMs: trk.duration_ms || 30000,
+                      category: 'My Songs'
+                    });
+                  }
+                }
+              }
+            } catch (e) {}
+          }
+        }
+      } catch (e) {
+        if (e.response?.status === 401) throw e;
+      }
+
+      return Array.from(tracksMap.values());
+    };
+
+    try {
+      let tracks = [];
+      try {
+        tracks = await fetchWithToken(token);
+      } catch (err) {
+        if (err.response?.status === 401 && refreshToken) {
+          console.log('[SpotifyService] 🔄 User access token expired for My Songs, refreshing...');
+          const refreshed = await this.refreshUserAccessToken(refreshToken);
+          if (refreshed?.accessToken) {
+            token = refreshed.accessToken;
+            // Update token in DB
+            try {
+              const { UserRepository } = await import('../repositories/UserRepository.js');
+              const userRepo = new UserRepository();
+              await userRepo.update(user.id, {
+                accessToken: refreshed.accessToken,
+                refreshToken: refreshed.refreshToken || refreshToken,
+                tokenExpiresAt: refreshed.tokenExpiresAt
+              });
+            } catch (dbErr) {}
+
+            tracks = await fetchWithToken(token);
+          }
+        } else {
+          throw err;
+        }
+      }
+
+      if (tracks.length > 0) {
+        console.log(`[SpotifyService] 🎵 Loaded ${tracks.length} personalized Spotify songs for user ${user.username || userId}`);
+        return tracks;
+      }
+    } catch (err) {
+      console.error('[SpotifyService] ❌ Failed to fetch user personal tracks:', err.message);
+    }
+
+    return [];
+  }
+
+  /**
    * Searches Spotify catalog with MySQL database query caching and local file image caching.
    * Returns top 5 results.
    */
