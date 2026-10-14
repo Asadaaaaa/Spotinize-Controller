@@ -41,6 +41,9 @@ export class App {
     this.app.get('/health', (req, res) => {
       res.json({ status: 'ok', service: 'spotinize-controller', timestamp: new Date() });
     });
+    this.app.get('/api/health', (req, res) => {
+      res.json({ status: 'ok', service: 'spotinize-controller', timestamp: new Date() });
+    });
 
     this.app.use('/api/auth', authRoutes);
     this.app.use('/api/game', gameRoutes);
