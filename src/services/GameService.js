@@ -30,7 +30,7 @@ export class GameService {
     if (category === 'My Songs') {
       rawTracks = await spotifyService.getUserPersonalTracks(userId);
       if (!rawTracks || rawTracks.length === 0) {
-        throw new Error('Tidak dapat memuat lagu dari Spotify kamu. Pastikan akun Spotify kamu sudah terhubung di menu profil!');
+        rawTracks = await spotifyService.getTopTracks('Global Trends');
       }
     } else {
       rawTracks = await spotifyService.getTopTracks(category, artistQuery);
@@ -115,7 +115,7 @@ export class GameService {
     if (game.category === 'My Songs') {
       rawTracks = await spotifyService.getUserPersonalTracks(hostUserId);
       if (!rawTracks || rawTracks.length === 0) {
-        throw new Error('Tidak dapat memuat lagu dari Spotify Host. Pastikan Host sudah menghubungkan akun Spotify di profil!');
+        rawTracks = await spotifyService.getTopTracks('Global Trends');
       }
     } else {
       rawTracks = await spotifyService.getTopTracks(game.category, game.artistQuery);

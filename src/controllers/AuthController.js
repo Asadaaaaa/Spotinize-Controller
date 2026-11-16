@@ -59,8 +59,8 @@ export class AuthController {
           spotifyConnected: user.spotifyConnected
         },
         token,
-        requireSpotifyConnect: true,
-        message: 'Akun berhasil dibuat! Silakan hubungkan akun Spotify Anda.'
+        requireSpotifyConnect: false,
+        message: 'Akun berhasil dibuat!'
       });
     } catch (err) {
       console.error('AuthController register error:', err);
@@ -105,7 +105,7 @@ export class AuthController {
           winRate: user.winRate || 0
         },
         token,
-        requireSpotifyConnect: !user.spotifyConnected
+        requireSpotifyConnect: false
       });
     } catch (err) {
       console.error('AuthController login error:', err);
