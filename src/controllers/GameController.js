@@ -2,6 +2,11 @@ import { gameService } from '../services/GameService.js';
 import { matchmakingService } from '../services/MatchmakingService.js';
 import { spotifyService } from '../services/SpotifyService.js';
 import { trackRepository } from '../repositories/TrackRepository.js';
+import {
+  broadcastLobbyUpdate,
+  broadcastGameFinish,
+  broadcastLeaveOutcome
+} from '../sockets/socketBroadcaster.js';
 
 export class GameController {
   async getDemoTrack(req, res) {
@@ -18,7 +23,7 @@ export class GameController {
 
       // 3 Decoys from subsequent tracks
       const decoys = tracks.slice(1, 8).filter(t => t.title.toLowerCase() !== targetTrack.title.toLowerCase()).slice(0, 3);
-      
+
       const rawOptions = [
         { title: targetTrack.title, artist: targetTrack.artist, isCorrect: true },
         ...decoys.map(d => ({ title: d.title, artist: d.artist, isCorrect: false }))
@@ -47,11 +52,20 @@ export class GameController {
       return res.status(500).json({ error: err.message });
     }
   }
+
+  async getActiveGame(req, res) {
+    try {
+      const userId = req.user.id;
+      const activeGame = await gameService.getActiveGame(userId);
+      return res.json({ activeGame });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   async createSolo(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
-      if (!userId) return res.status(401).json({ error: 'User ID is required' });
-
+      const userId = req.user.id;
       const { category, artistQuery, numberOfSongs } = req.body;
       const gameState = await gameService.createSoloGame(userId, {
         category: category || 'Global Trends',
@@ -68,9 +82,7 @@ export class GameController {
 
   async createMultiplayer(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
-      if (!userId) return res.status(401).json({ error: 'User ID is required' });
-
+      const userId = req.user.id;
       const { category, artistQuery, numberOfSongs } = req.body;
       const game = await matchmakingService.createRoom(userId, {
         category: category || 'Global Trends',
@@ -87,14 +99,19 @@ export class GameController {
 
   async joinMultiplayer(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
+      const userId = req.user.id;
       const { roomCode } = req.body;
 
-      if (!userId) return res.status(401).json({ error: 'User ID is required' });
       if (!roomCode) return res.status(400).json({ error: 'Room code is required' });
 
       const game = await matchmakingService.joinRoom(roomCode, userId);
       const gameState = await gameService.getGameState(game.id, userId);
+
+      const io = req.app?.get('io');
+      if (io && game.status === 'WAITING') {
+        await broadcastLobbyUpdate(io, game.id);
+      }
+
       return res.json(gameState);
     } catch (err) {
       return res.status(400).json({ error: err.message });
@@ -103,7 +120,7 @@ export class GameController {
 
   async startMultiplayer(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
+      const userId = req.user.id;
       const { gameId } = req.params;
 
       const game = await gameService.startMultiplayerGame(gameId, userId);
@@ -127,7 +144,7 @@ export class GameController {
 
   async getGameState(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.query.userId;
+      const userId = req.user.id;
       const { gameId } = req.params;
 
       const state = await gameService.getGameState(gameId, userId);
@@ -141,10 +158,19 @@ export class GameController {
 
   async startTimer(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
+      const userId = req.user.id;
       const { gameId } = req.params;
 
       const player = await gameService.startRoundTimer(gameId, userId);
+      const io = req.app?.get('io');
+      if (io && player) {
+        io.to(`game:${gameId}`).emit('status:update', {
+          userId,
+          status: 'THINKING',
+          currentRound: player.currentRound
+        });
+      }
+
       return res.json({ player });
     } catch (err) {
       return res.status(500).json({ error: err.message });
@@ -153,7 +179,7 @@ export class GameController {
 
   async revealNext(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
+      const userId = req.user.id;
       const { gameId } = req.params;
 
       const player = await gameService.revealNext(gameId, userId);
@@ -165,7 +191,7 @@ export class GameController {
 
   async submitGuess(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
+      const userId = req.user.id;
       const { gameId } = req.params;
       const { track } = req.body; // { title, artist, spotifyId }
 
@@ -174,6 +200,36 @@ export class GameController {
       }
 
       const result = await gameService.submitGuess(gameId, userId, track);
+      const io = req.app?.get('io');
+      if (io) {
+        if (result.isCorrect) {
+          io.to(`game:${gameId}`).emit('score:update', {
+            userId,
+            score: result.player.score,
+            totalThinkingTime: result.player.totalThinkingTime,
+            status: 'GUESSED',
+            currentRound: result.player.currentRound
+          });
+        } else {
+          io.to(`game:${gameId}`).emit('status:update', {
+            userId,
+            status: result.isRoundOver ? 'WRONG' : 'THINKING',
+            currentRound: result.player.currentRound
+          });
+        }
+
+        const updatedState = await gameService.getGameState(gameId, userId);
+        if (updatedState) {
+          io.to(`game:${gameId}`).emit('ranking:update', {
+            leaderboard: updatedState.leaderboard
+          });
+
+          if (updatedState.status === 'FINISHED' || updatedState.isFinished) {
+            broadcastGameFinish(io, gameId, updatedState.leaderboard);
+          }
+        }
+      }
+
       return res.json(result);
     } catch (err) {
       return res.status(400).json({ error: err.message });
@@ -182,31 +238,56 @@ export class GameController {
 
   async skipRound(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
+      const userId = req.user.id;
       const { gameId } = req.params;
 
       const result = await gameService.skipRound(gameId, userId);
+      const io = req.app?.get('io');
+      if (io) {
+        io.to(`game:${gameId}`).emit('status:update', {
+          userId,
+          status: 'SKIPPED',
+          currentRound: result.player.currentRound
+        });
+
+        const updatedState = await gameService.getGameState(gameId, userId);
+        if (updatedState) {
+          io.to(`game:${gameId}`).emit('ranking:update', {
+            leaderboard: updatedState.leaderboard
+          });
+
+          if (updatedState.status === 'FINISHED' || updatedState.isFinished) {
+            broadcastGameFinish(io, gameId, updatedState.leaderboard);
+          }
+        }
+      }
+
       return res.json(result);
     } catch (err) {
-      return res.status(500).json({ error: err.message });
+      return res.status(400).json({ error: err.message });
     }
   }
 
   async nextRound(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
+      const userId = req.user.id;
       const { gameId } = req.params;
 
       await gameService.nextRound(gameId, userId);
 
       // Always return the canonical getGameState format
       const gameState = await gameService.getGameState(gameId, userId);
-
-      // If game just finished, broadcast to all players in the room
-      if (gameState.status === 'FINISHED' || gameState.isFinished) {
-        const io = req.app?.get('io');
-        if (io) {
-          io.to(`game:${gameId}`).emit('game:finish', {
+      const io = req.app?.get('io');
+      if (io && gameState) {
+        if (gameState.status === 'FINISHED' || gameState.isFinished) {
+          broadcastGameFinish(io, gameId, gameState.leaderboard);
+        } else if (gameState.mode === 'MULTIPLAYER') {
+          io.to(`game:${gameId}`).emit('status:update', {
+            userId,
+            status: gameState.player?.status || 'THINKING',
+            currentRound: gameState.currentRound
+          });
+          io.to(`game:${gameId}`).emit('ranking:update', {
             leaderboard: gameState.leaderboard
           });
         }
@@ -220,11 +301,13 @@ export class GameController {
 
   async leaveGame(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
+      const userId = req.user.id;
       const { gameId } = req.params;
 
-      const game = await matchmakingService.leaveRoom(gameId, userId);
-      return res.json({ success: true, game });
+      const outcome = await matchmakingService.leaveRoom(gameId, userId);
+      await broadcastLeaveOutcome(req.app?.get('io'), gameId, userId, outcome.previousStatus);
+
+      return res.json({ success: true, game: outcome.game });
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
@@ -232,13 +315,15 @@ export class GameController {
 
   async toggleReady(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
+      const userId = req.user.id;
       const { gameId } = req.params;
 
       const player = await matchmakingService.toggleReady(gameId, userId);
+      await broadcastLobbyUpdate(req.app?.get('io'), gameId);
+
       return res.json({ player });
     } catch (err) {
-      return res.status(500).json({ error: err.message });
+      return res.status(400).json({ error: err.message });
     }
   }
 }

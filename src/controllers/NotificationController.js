@@ -5,9 +5,7 @@ import { gameRepository } from '../repositories/GameRepository.js';
 export class NotificationController {
   async getNotifications(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.query.userId;
-      if (!userId) return res.status(401).json({ error: 'User ID is required' });
-
+      const userId = req.user.id;
       const notifications = await notificationRepository.findByUserId(userId);
       const unreadCount = await notificationRepository.countUnread(userId);
 
@@ -19,7 +17,7 @@ export class NotificationController {
 
   async markAsRead(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
+      const userId = req.user.id;
       const { id } = req.params;
 
       const notif = await notificationRepository.markAsRead(id, userId);
@@ -31,9 +29,7 @@ export class NotificationController {
 
   async markAllAsRead(req, res) {
     try {
-      const userId = req.headers['x-user-id'] || req.body.userId;
-      if (!userId) return res.status(401).json({ error: 'User ID is required' });
-
+      const userId = req.user.id;
       await notificationRepository.markAllAsRead(userId);
       return res.json({ success: true });
     } catch (err) {
@@ -43,7 +39,7 @@ export class NotificationController {
 
   async sendInvite(req, res) {
     try {
-      const hostUserId = req.headers['x-user-id'] || req.body.userId;
+      const hostUserId = req.user.id;
       const { targetUserId, roomCode, gameId } = req.body;
 
       if (!hostUserId || !targetUserId || !roomCode) {
@@ -62,7 +58,7 @@ export class NotificationController {
 
       const title = `Undangan Main dari ${host.displayName}`;
       const message = `${host.displayName} mengajak kamu bermain tebak lagu di Room [${roomCode}] (${game?.category || 'Global Trends'})!`;
-      
+
       const data = {
         roomCode,
         gameId: game?.id,

@@ -1,5 +1,5 @@
 import { gameService } from '../services/GameService.js';
-import { gameRepository } from '../repositories/GameRepository.js';
+import { broadcastGameFinish } from './socketBroadcaster.js';
 
 export class GameSocket {
   constructor(io) {
@@ -7,26 +7,36 @@ export class GameSocket {
   }
 
   registerEvents(socket) {
+    const requireSocketAuth = () => {
+      if (!socket.authenticated || !socket.userId) {
+        socket.emit('error', { message: 'Autentikasi socket diperlukan.' });
+        return false;
+      }
+      return true;
+    };
+
     // Player triggers initial playback -> starts timer
-    socket.on('player:play', async ({ gameId, userId, roundNumber }) => {
+    socket.on('player:play', async ({ gameId, roundNumber } = {}) => {
       try {
-        await gameService.startRoundTimer(gameId, userId, roundNumber);
-        const player = await gameRepository.getPlayer(gameId, userId);
-        
-        // Notify room that player is thinking
+        if (!requireSocketAuth() || !gameId) return;
+        const userId = socket.userId;
+        const player = await gameService.startRoundTimer(gameId, userId, roundNumber);
+
         this.io.to(`game:${gameId}`).emit('status:update', {
           userId,
-          status: 'THINKING'
+          status: 'THINKING',
+          currentRound: player?.currentRound
         });
       } catch (err) {
         socket.emit('error', { message: err.message });
       }
     });
 
-    // Player requests progressive reveal (0.1s -> 0.5s -> 1s -> 2s -> 3s -> 4s -> 5s)
-    socket.on('player:reveal', async ({ gameId, userId }) => {
+    // Player requests progressive reveal
+    socket.on('player:reveal', async ({ gameId } = {}) => {
       try {
-        const player = await gameService.revealNext(gameId, userId);
+        if (!requireSocketAuth() || !gameId) return;
+        const player = await gameService.revealNext(gameId, socket.userId);
         socket.emit('player:reveal_success', {
           revealLevel: player.currentRevealLevel
         });
@@ -36,44 +46,38 @@ export class GameSocket {
     });
 
     // Player submits a guess
-    socket.on('player:guess', async ({ gameId, userId, track }) => {
+    socket.on('player:guess', async ({ gameId, track } = {}) => {
       try {
+        if (!requireSocketAuth() || !gameId) return;
+        const userId = socket.userId;
         const result = await gameService.submitGuess(gameId, userId, track);
 
         if (result.isCorrect) {
-          // Send success payload to guessing player
           socket.emit('player:correct', result);
-
-          // Broadcast status & score update to entire room (Section 38 & 39)
           this.io.to(`game:${gameId}`).emit('score:update', {
             userId,
             score: result.player.score,
             totalThinkingTime: result.player.totalThinkingTime,
-            status: 'GUESSED'
+            status: 'GUESSED',
+            currentRound: result.player.currentRound
           });
         } else {
-          // Wrong guess
           socket.emit('player:wrong', result);
-
           this.io.to(`game:${gameId}`).emit('status:update', {
             userId,
-            status: result.isRoundOver ? 'WRONG' : 'THINKING'
+            status: result.isRoundOver ? 'WRONG' : 'THINKING',
+            currentRound: result.player.currentRound
           });
         }
 
-        // Broadcast updated rankings
         const updatedState = await gameService.getGameState(gameId, userId);
-        this.io.to(`game:${gameId}`).emit('ranking:update', {
-          leaderboard: updatedState.leaderboard
-        });
+        if (updatedState) {
+          this.io.to(`game:${gameId}`).emit('ranking:update', {
+            leaderboard: updatedState.leaderboard
+          });
 
-        // Check if all players finished round in multiplayer
-        if (updatedState.mode === 'MULTIPLAYER') {
-          const allDone = updatedState.leaderboard.every(p => p.status !== 'THINKING');
-          if (allDone) {
-            this.io.to(`game:${gameId}`).emit('game:round:finish', {
-              roundNumber: updatedState.currentRound
-            });
+          if (updatedState.status === 'FINISHED' || updatedState.isFinished) {
+            broadcastGameFinish(this.io, gameId, updatedState.leaderboard);
           }
         }
       } catch (err) {
@@ -82,39 +86,55 @@ export class GameSocket {
     });
 
     // Player skips round
-    socket.on('player:skip', async ({ gameId, userId }) => {
+    socket.on('player:skip', async ({ gameId } = {}) => {
       try {
+        if (!requireSocketAuth() || !gameId) return;
+        const userId = socket.userId;
         const result = await gameService.skipRound(gameId, userId);
         socket.emit('player:skip_success', result);
 
         this.io.to(`game:${gameId}`).emit('status:update', {
           userId,
-          status: 'SKIPPED'
+          status: 'SKIPPED',
+          currentRound: result.player.currentRound
         });
 
         const updatedState = await gameService.getGameState(gameId, userId);
-        this.io.to(`game:${gameId}`).emit('ranking:update', {
-          leaderboard: updatedState.leaderboard
-        });
+        if (updatedState) {
+          this.io.to(`game:${gameId}`).emit('ranking:update', {
+            leaderboard: updatedState.leaderboard
+          });
+
+          if (updatedState.status === 'FINISHED' || updatedState.isFinished) {
+            broadcastGameFinish(this.io, gameId, updatedState.leaderboard);
+          }
+        }
       } catch (err) {
         socket.emit('error', { message: err.message });
       }
     });
 
-    // Advance to next round
-    socket.on('game:next', async ({ gameId, userId }) => {
+    // Advance to next round (individual player only — never broadcast game:round:start room-wide)
+    socket.on('game:next', async ({ gameId } = {}) => {
       try {
+        if (!requireSocketAuth() || !gameId) return;
+        const userId = socket.userId;
         const state = await gameService.nextRound(gameId, userId);
-        
-        if (state.isFinished) {
-          this.io.to(`game:${gameId}`).emit('game:finish', {
-            leaderboard: state.leaderboard
-          });
+
+        if (state.isFinished || state.status === 'FINISHED') {
+          broadcastGameFinish(this.io, gameId, state.leaderboard);
         } else {
           socket.emit('game:state', state);
-          this.io.to(`game:${gameId}`).emit('game:round:start', {
-            currentRound: state.currentRound
-          });
+          if (state.mode === 'MULTIPLAYER') {
+            this.io.to(`game:${gameId}`).emit('status:update', {
+              userId,
+              status: state.player?.status || 'THINKING',
+              currentRound: state.currentRound
+            });
+            this.io.to(`game:${gameId}`).emit('ranking:update', {
+              leaderboard: state.leaderboard
+            });
+          }
         }
       } catch (err) {
         socket.emit('error', { message: err.message });

@@ -1,3 +1,4 @@
+import { Op } from 'sequelize';
 import { Game, GamePlayer, GameRound, Track, User, Guess } from '../models/index.js';
 
 export class GameRepository {
@@ -23,7 +24,8 @@ export class GameRepository {
           as: 'host',
           attributes: ['id', 'spotifyId', 'displayName', 'avatarUrl']
         }
-      ]
+      ],
+      order: [[{ model: GameRound, as: 'rounds' }, 'roundNumber', 'ASC']]
     });
   }
 
@@ -46,7 +48,8 @@ export class GameRepository {
           as: 'host',
           attributes: ['id', 'spotifyId', 'displayName', 'avatarUrl']
         }
-      ]
+      ],
+      order: [[{ model: GameRound, as: 'rounds' }, 'roundNumber', 'ASC']]
     });
   }
 
@@ -86,15 +89,38 @@ export class GameRepository {
     return await player.update(updateData);
   }
 
-  async getPlayersByGame(gameId) {
+  async getPlayersByGame(gameId, gameStatus = null) {
+    const order = gameStatus === 'WAITING'
+      ? [['isHost', 'DESC'], ['createdAt', 'ASC']]
+      : [['score', 'DESC'], ['totalThinkingTime', 'ASC'], ['isHost', 'DESC'], ['createdAt', 'ASC']];
+
     return await GamePlayer.findAll({
       where: { gameId },
       include: [{ model: User, as: 'user', attributes: ['id', 'spotifyId', 'displayName', 'avatarUrl'] }],
-      order: [
-        ['score', 'DESC'],
-        ['totalThinkingTime', 'ASC']
-      ]
+      order
     });
+  }
+
+  async findActiveGameForUser(userId) {
+    if (!userId) return null;
+    const record = await GamePlayer.findOne({
+      where: {
+        userId,
+        status: { [Op.ne]: 'LEFT' }
+      },
+      include: [
+        {
+          model: Game,
+          as: 'game',
+          where: {
+            status: { [Op.in]: ['WAITING', 'STARTING', 'PLAYING'] }
+          },
+          required: true
+        }
+      ],
+      order: [['updatedAt', 'DESC']]
+    });
+    return record?.game || null;
   }
 
   // Round operations

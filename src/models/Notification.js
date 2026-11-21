@@ -46,7 +46,8 @@ Notification.init(
     sequelize,
     modelName: 'Notification',
     tableName: 'notifications',
-    timestamps: true
+    timestamps: true,
+    underscored: false
   }
 );
 

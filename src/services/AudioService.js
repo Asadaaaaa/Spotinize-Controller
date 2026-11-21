@@ -4,6 +4,8 @@ import { exec } from 'child_process';
 import util from 'util';
 import axios from 'axios';
 import { fileURLToPath } from 'url';
+import { Normalizer } from '../utils/Normalizer.js';
+import { TrackMatcher } from '../utils/TrackMatcher.js';
 
 const execPromise = util.promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
@@ -83,35 +85,135 @@ export class AudioService {
     return null;
   }
 
+  _normalizeToken(str) {
+    if (!str || typeof str !== 'string') return '';
+    return str
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^\w\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  _splitArtistCredits(artistStr) {
+    if (!artistStr || typeof artistStr !== 'string') return [];
+    const tokens = artistStr
+      .split(/,|&|\band\b|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\bwith\b|\bx\b|\//i)
+      .map(part => this._normalizeToken(part))
+      .filter(Boolean);
+    const full = this._normalizeToken(artistStr);
+    if (full && !tokens.includes(full)) {
+      tokens.unshift(full);
+    }
+    return tokens;
+  }
+
+  _isStrictArtistCreditMatch(candidateArtist, targetArtist) {
+    const candCredits = this._splitArtistCredits(candidateArtist);
+    const targetCredits = this._splitArtistCredits(targetArtist);
+    if (candCredits.length === 0 || targetCredits.length === 0) return false;
+
+    for (const t of targetCredits) {
+      const tNoThe = t.replace(/^the\s+/, '');
+      for (const c of candCredits) {
+        if (t === c) return true;
+        const cNoThe = c.replace(/^the\s+/, '');
+        if (tNoThe.length >= 3 && tNoThe === cNoThe) return true;
+      }
+    }
+    return false;
+  }
+
+  _isUnwantedPreview(item, targetTitle, targetArtist) {
+    const haystack = `${item.trackName || ''} ${item.collectionName || ''} ${item.artistName || ''}`.toLowerCase();
+    const targetHaystack = `${targetTitle || ''} ${targetArtist || ''}`.toLowerCase();
+    const bannedTerms = [
+      'karaoke', 'tribute', 'lullaby', 'cover', 'originally performed',
+      'made famous', 'in the style of', '8-bit', 'ringtone', 'music box',
+      'instrumental', 'slowed', 'sped up'
+    ];
+    for (const term of bannedTerms) {
+      if (haystack.includes(term) && !targetHaystack.includes(term)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _scoreTitleMatch(candidateTrackName, targetNormTitle) {
+    const normCand = Normalizer.normalizeTitle(candidateTrackName);
+    if (!normCand || !targetNormTitle) return 0;
+    if (normCand === targetNormTitle) return 100;
+
+    const sim = TrackMatcher._similarity(normCand, targetNormTitle);
+    if (sim >= 0.85) return Math.round(sim * 90);
+
+    if (normCand.length >= 4 && targetNormTitle.length >= 4) {
+      const ratio = Math.min(normCand.length, targetNormTitle.length) / Math.max(normCand.length, targetNormTitle.length);
+      if (ratio >= 0.65 && (normCand.includes(targetNormTitle) || targetNormTitle.includes(normCand))) {
+        return 75;
+      }
+    }
+    return 0;
+  }
+
+  _escapeShellArg(str) {
+    return (str || '').replace(/["`$\\]/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
   /**
-   * Tries to find an iTunes preview URL for a track
+   * Tries to find a verified iTunes preview URL for a track (never returns unverified results[0]).
    */
   async _findItunesPreviewUrl(title, artist) {
     try {
-      const queries = [
-        `${artist} ${title}`,
-        `${title} ${artist}`,
-        `${title}`
-      ];
+      const normTitle = Normalizer.normalizeTitle(title);
+      const primaryArtist = Normalizer.normalizeArtist(artist);
+      const queries = [...new Set([
+        `${primaryArtist} ${normTitle}`.trim(),
+        `${artist} ${title}`.trim()
+      ])].filter(Boolean);
 
-      for (const q of queries) {
-        const res = await axios.get('https://itunes.apple.com/search', {
-          params: { term: q, entity: 'song', limit: 5 },
-          timeout: 5000
-        });
+      if (queries.length === 0 || !normTitle || !primaryArtist) return null;
 
-        if (res.data?.results?.length > 0) {
-          // Try to find exact match first
-          const exactMatch = res.data.results.find(item =>
-            item.trackName?.toLowerCase().includes(title.toLowerCase()) &&
-            item.artistName?.toLowerCase().includes(artist.split(',')[0].trim().toLowerCase())
-          );
-          
-          if (exactMatch?.previewUrl) return exactMatch.previewUrl;
+      const countries = ['ID', 'US'];
+      let bestMatch = null;
 
-          // Fallback to first result with preview
-          const withPreview = res.data.results.find(item => item.previewUrl);
-          if (withPreview?.previewUrl) return withPreview.previewUrl;
+      for (const country of countries) {
+        for (const q of queries) {
+          const res = await axios.get('https://itunes.apple.com/search', {
+            params: { term: q, media: 'music', entity: 'song', country, limit: 10 },
+            timeout: 5000
+          });
+
+          const results = res.data?.results || [];
+          for (const item of results) {
+            if (!item.previewUrl) continue;
+            if (this._isUnwantedPreview(item, title, artist)) continue;
+            if (!this._isStrictArtistCreditMatch(item.artistName, artist)) continue;
+
+            const titleScore = this._scoreTitleMatch(item.trackName, normTitle);
+            if (titleScore === 0) continue;
+
+            let totalScore = titleScore;
+            if (this._normalizeToken(item.artistName) === this._normalizeToken(artist)) {
+              totalScore += 10;
+            }
+            if (!/\b(live|remaster|acoustic|remix)\b/i.test(item.trackName || '') || /\b(live|remaster|acoustic|remix)\b/i.test(title || '')) {
+              totalScore += 5;
+            }
+
+            if (!bestMatch || totalScore > bestMatch.score) {
+              bestMatch = { url: item.previewUrl, score: totalScore };
+            }
+          }
+
+          if (bestMatch && bestMatch.score >= 100) {
+            return bestMatch.url;
+          }
+        }
+        if (bestMatch) {
+          return bestMatch.url;
         }
       }
     } catch (err) {
@@ -162,9 +264,11 @@ export class AudioService {
     // 4. SoundCloud via yt-dlp (may be blocked)
     console.log(`   [Strategy 3] Trying SoundCloud via yt-dlp...`);
     const basePath = sourcePath.replace(/\.mp3$/, '');
+    const safeArtistQuery = this._escapeShellArg(artist);
+    const safeTitleQuery = this._escapeShellArg(title);
     const scQueries = [
-      `scsearch1:${artist} ${title}`,
-      `scsearch1:${title} ${artist}`
+      `scsearch1:${safeArtistQuery} ${safeTitleQuery}`,
+      `scsearch1:${safeTitleQuery} ${safeArtistQuery}`
     ];
 
     for (const scQuery of scQueries) {
@@ -187,8 +291,8 @@ export class AudioService {
     // 5. YouTube via yt-dlp (last resort, may need cookies)
     console.log(`   [Strategy 4] Trying YouTube via yt-dlp...`);
     const ytQueries = [
-      `ytsearch1:${artist} ${title} official audio`,
-      `ytsearch1:${artist} ${title}`
+      `ytsearch1:${safeArtistQuery} ${safeTitleQuery} official audio`,
+      `ytsearch1:${safeArtistQuery} ${safeTitleQuery}`
     ];
 
     for (const ytQuery of ytQueries) {

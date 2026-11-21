@@ -1,3 +1,4 @@
+import { Game, GameRound } from '../models/index.js';
 import { gameRepository } from '../repositories/GameRepository.js';
 import { trackRepository } from '../repositories/TrackRepository.js';
 import { userRepository } from '../repositories/UserRepository.js';
@@ -35,7 +36,7 @@ export class GameService {
     } else {
       rawTracks = await spotifyService.getTopTracks(category, artistQuery);
     }
-    
+
     // Filter recently played tracks within 24h
     const eligibleTracks = await recentlyPlayedService.filterEligibleTracks(
       rawTracks,
@@ -88,7 +89,7 @@ export class GameService {
   }
 
   /**
-   * Starts a Multiplayer Game
+   * Starts a Multiplayer Game with atomic STARTING lock to prevent duplicate rounds.
    */
   async startMultiplayerGame(gameId, hostUserId) {
     const game = await gameRepository.findById(gameId);
@@ -99,9 +100,18 @@ export class GameService {
     if (game.status === 'PLAYING') {
       return game;
     }
+    if (game.status === 'STARTING') {
+      throw new Error('Game sedang dimulai, mohon tunggu sebentar...');
+    }
+    if (game.status !== 'WAITING') {
+      throw new Error('Game tidak dapat dimulai.');
+    }
 
-    // Get all player IDs in the room
-    const players = await gameRepository.getPlayersByGame(gameId);
+    // Get all players in the room
+    const players = await gameRepository.getPlayersByGame(gameId, 'WAITING');
+    if (players.length < 2) {
+      throw new Error('Minimal 2 pemain diperlukan untuk memulai game Multiplayer!');
+    }
     const playerIds = players.map(p => p.userId);
 
     // Validate that ALL non-host players are Ready
@@ -111,59 +121,89 @@ export class GameService {
       throw new Error('Semua pemain harus siap (Ready) sebelum game dapat dimulai!');
     }
 
-    let rawTracks = [];
-    if (game.category === 'My Songs') {
-      rawTracks = await spotifyService.getUserPersonalTracks(hostUserId);
-      if (!rawTracks || rawTracks.length === 0) {
-        rawTracks = await spotifyService.getTopTracks('Global Trends');
-      }
-    } else {
-      rawTracks = await spotifyService.getTopTracks(game.category, game.artistQuery);
-    }
-
-    const eligibleTracks = await recentlyPlayedService.filterEligibleTracks(
-      rawTracks,
-      hostUserId,
-      'MULTIPLAYER',
-      game.category,
-      game.numberOfSongs
+    // Atomic transition WAITING -> STARTING
+    const [affected] = await Game.update(
+      { status: 'STARTING' },
+      { where: { id: gameId, status: 'WAITING' } }
     );
 
-    const savedTracks = await trackRepository.bulkUpsert(eligibleTracks.slice(0, game.numberOfSongs));
-
-    // Create Rounds
-    for (let i = 0; i < savedTracks.length; i++) {
-      const track = savedTracks[i];
-      await gameRepository.createRound(game.id, i + 1, track.id);
+    if (affected === 0) {
+      const refreshed = await gameRepository.findById(gameId);
+      if (refreshed?.status === 'PLAYING') return refreshed;
+      throw new Error('Game sedang dimulai, mohon tunggu sebentar...');
     }
 
-    // Record to recently_played for all players in room
-    recentlyPlayedService.commitPlayedTracks(playerIds, savedTracks, 'MULTIPLAYER', game.category);
+    try {
+      let rawTracks = [];
+      if (game.category === 'My Songs') {
+        rawTracks = await spotifyService.getUserPersonalTracks(hostUserId);
+        if (!rawTracks || rawTracks.length === 0) {
+          rawTracks = await spotifyService.getTopTracks('Global Trends');
+        }
+      } else {
+        rawTracks = await spotifyService.getTopTracks(game.category, game.artistQuery);
+      }
 
-    // Preload audio clips in background (non-blocking so client enters room immediately)
-    audioService.preloadGameAudio(savedTracks).catch(err => {
-      console.warn('[GameService] Background preload notice:', err.message);
-    });
+      const eligibleTracks = await recentlyPlayedService.filterEligibleTracks(
+        rawTracks,
+        hostUserId,
+        'MULTIPLAYER',
+        game.category,
+        game.numberOfSongs
+      );
 
-    await gameRepository.update(gameId, {
-      status: 'PLAYING',
-      currentRound: 1,
-      numberOfSongs: savedTracks.length
-    });
+      const shuffled = this._shuffle(eligibleTracks);
+      const selectedTracks = shuffled.slice(0, Math.min(game.numberOfSongs, shuffled.length));
 
-    // Reset players for round 1
-    for (const p of players) {
-      await gameRepository.updatePlayer(gameId, p.userId, {
-        currentRound: 1,
-        currentRevealLevel: 0.1,
-        remainingAttempts: 3,
-        status: 'THINKING',
-        roundStartedAt: null,
-        roundThinkingTime: 0
+      if (selectedTracks.length === 0) {
+        throw new Error('Tidak ada lagu yang tersedia untuk kategori ini.');
+      }
+
+      const savedTracks = await trackRepository.bulkUpsert(selectedTracks);
+
+      // Clean any stray rounds before creating ordered 1..N rounds
+      await GameRound.destroy({ where: { gameId } });
+
+      for (let i = 0; i < savedTracks.length; i++) {
+        const track = savedTracks[i];
+        await gameRepository.createRound(game.id, i + 1, track.id);
+      }
+
+      // Record to recently_played for all players in room
+      recentlyPlayedService.commitPlayedTracks(playerIds, savedTracks, 'MULTIPLAYER', game.category);
+
+      // Preload audio clips in background (non-blocking so client enters room immediately)
+      audioService.preloadGameAudio(savedTracks).catch(err => {
+        console.warn('[GameService] Background preload notice:', err.message);
       });
-    }
 
-    return await gameRepository.findById(gameId);
+      await gameRepository.update(gameId, {
+        status: 'PLAYING',
+        currentRound: 1,
+        numberOfSongs: savedTracks.length
+      });
+
+      // Reset players for round 1
+      for (const p of players) {
+        await gameRepository.updatePlayer(gameId, p.userId, {
+          score: 0,
+          currentRound: 1,
+          currentRevealLevel: 0.1,
+          remainingAttempts: 3,
+          status: 'THINKING',
+          roundStartedAt: null,
+          roundThinkingTime: 0,
+          totalThinkingTime: 0,
+          rank: null
+        });
+      }
+
+      return await gameRepository.findById(gameId);
+    } catch (err) {
+      await GameRound.destroy({ where: { gameId } });
+      await Game.update({ status: 'WAITING' }, { where: { id: gameId, status: 'STARTING' } });
+      throw err;
+    }
   }
 
   /**
@@ -173,7 +213,7 @@ export class GameService {
     const player = await gameRepository.getPlayer(gameId, userId);
     if (!player) return null;
 
-    if (!player.roundStartedAt) {
+    if (!player.roundStartedAt && player.status === 'THINKING') {
       await gameRepository.updatePlayer(gameId, userId, {
         roundStartedAt: new Date(),
         status: 'THINKING'
@@ -215,11 +255,12 @@ export class GameService {
   async submitGuess(gameId, userId, guessedTrack) {
     const game = await gameRepository.findById(gameId);
     if (!game) throw new Error('Game tidak ditemukan');
+    if (game.status !== 'PLAYING') throw new Error('Game tidak sedang berlangsung');
 
     const player = await gameRepository.getPlayer(gameId, userId);
     if (!player) throw new Error('Player tidak ditemukan');
 
-    if (player.status === 'GUESSED' || player.status === 'SKIPPED' || player.remainingAttempts <= 0) {
+    if (player.status === 'GUESSED' || player.status === 'SKIPPED' || player.status === 'LEFT' || player.remainingAttempts <= 0) {
       throw new Error('Round ini sudah selesai untuk kamu');
     }
 
@@ -266,6 +307,11 @@ export class GameService {
       status: newStatus
     });
 
+    // If this was the final round and round ended for this player, check if all players are done
+    if (game.mode === 'MULTIPLAYER' && result.isRoundOver && player.currentRound >= game.numberOfSongs) {
+      await this.checkAndFinishMultiplayerGame(gameId);
+    }
+
     return {
       ...result,
       targetTrack: result.isRoundOver ? round.track : null,
@@ -277,8 +323,15 @@ export class GameService {
    * Skips current round (Score = 0)
    */
   async skipRound(gameId, userId) {
+    const game = await gameRepository.findById(gameId);
+    if (!game) throw new Error('Game tidak ditemukan');
+    if (game.status !== 'PLAYING') throw new Error('Game tidak sedang berlangsung');
+
     const player = await gameRepository.getPlayer(gameId, userId);
     if (!player) throw new Error('Player tidak ditemukan');
+    if (player.status !== 'THINKING') {
+      throw new Error('Round ini sudah selesai untuk kamu');
+    }
 
     const round = await gameRepository.getRound(gameId, player.currentRound);
     if (!round) throw new Error('Round tidak ditemukan');
@@ -292,6 +345,10 @@ export class GameService {
       totalThinkingTime: Math.round((player.totalThinkingTime + thinkingTime) * 100) / 100,
       roundThinkingTime: thinkingTime
     });
+
+    if (game.mode === 'MULTIPLAYER' && player.currentRound >= game.numberOfSongs) {
+      await this.checkAndFinishMultiplayerGame(gameId);
+    }
 
     return {
       isRoundOver: true,
@@ -307,18 +364,25 @@ export class GameService {
     const game = await gameRepository.findById(gameId);
     if (!game) throw new Error('Game tidak ditemukan');
 
+    if (game.status === 'FINISHED') {
+      return await this.getGameState(gameId, userId);
+    }
+
     const player = await gameRepository.getPlayer(gameId, userId);
     if (!player) throw new Error('Player tidak ditemukan');
+
+    if (player.status === 'THINKING') {
+      return await this.getGameState(gameId, userId);
+    }
 
     const nextRoundNumber = player.currentRound + 1;
 
     if (nextRoundNumber > game.numberOfSongs) {
-      // Game is finished for this player / all players
       if (game.mode === 'SOLO') {
         return await this.finishSoloGame(gameId, userId);
       } else {
-        // Multiplayer check if all players reached end
-        return await this.checkAndFinishMultiplayerGame(gameId);
+        await this.checkAndFinishMultiplayerGame(gameId);
+        return await this.getGameState(gameId, userId);
       }
     }
 
@@ -347,8 +411,7 @@ export class GameService {
     const player = await gameRepository.getPlayer(gameId, userId);
     const game = await gameRepository.findById(gameId);
 
-    // Calculate correct / wrong / skipped from guesses
-    const rounds = game.rounds || [];
+    const rounds = [...(game.rounds || [])].sort((a, b) => a.roundNumber - b.roundNumber);
     const playedTracks = rounds.map(r => r.track).filter(Boolean);
 
     let correctCount = 0;
@@ -400,28 +463,32 @@ export class GameService {
   }
 
   /**
-   * Finishes Multiplayer game and computes rankings
+   * Finishes Multiplayer game atomically and computes rankings & stats
    */
   async finishMultiplayerGame(gameId) {
+    const [affected] = await Game.update(
+      { status: 'FINISHED', finishedAt: new Date() },
+      { where: { id: gameId, status: 'PLAYING' } }
+    );
+
+    if (affected === 0) {
+      return await gameRepository.findById(gameId);
+    }
+
     const game = await gameRepository.findById(gameId);
-    if (!game || game.status === 'FINISHED') return game;
-
-    await gameRepository.update(gameId, {
-      status: 'FINISHED',
-      finishedAt: new Date()
-    });
-
     const players = await gameRepository.getPlayersByGame(gameId);
-    
-    // Sort ranking: 1st by highest score, 2nd by lowest totalThinkingTime
+
+    // Sort ranking: non-LEFT first, then highest score, then lowest totalThinkingTime
     const sortedPlayers = [...players].sort((a, b) => {
-      if (b.score !== a.score) {
-        return b.score - a.score;
-      }
+      const aLeft = a.status === 'LEFT' ? 1 : 0;
+      const bLeft = b.status === 'LEFT' ? 1 : 0;
+      if (aLeft !== bLeft) return aLeft - bLeft;
+      if (b.score !== a.score) return b.score - a.score;
       return a.totalThinkingTime - b.totalThinkingTime;
     });
 
-    const playedTracks = (game.rounds || []).map(r => r.track).filter(Boolean);
+    const rounds = [...(game.rounds || [])].sort((a, b) => a.roundNumber - b.roundNumber);
+    const playedTracks = rounds.map(r => r.track).filter(Boolean);
     const activeUserIds = [];
 
     for (let i = 0; i < sortedPlayers.length; i++) {
@@ -429,10 +496,28 @@ export class GameService {
       const rank = i + 1;
       const isWinner = rank === 1 && p.status !== 'LEFT';
 
-      await gameRepository.updatePlayer(gameId, p.userId, { rank });
-      activeUserIds.push(p.userId);
+      let correctCount = 0;
+      let wrongCount = 0;
+      let skippedCount = 0;
 
-      // Record history
+      for (const r of rounds) {
+        if (p.status === 'LEFT' && r.roundNumber > p.currentRound) continue;
+        const guesses = await gameRepository.getGuessesForRound(r.id, p.userId);
+        if (guesses.some(g => g.isCorrect)) {
+          correctCount++;
+        } else if (guesses.length >= 3) {
+          wrongCount++;
+        } else if (r.roundNumber < p.currentRound || p.status === 'SKIPPED' || p.status !== 'THINKING') {
+          skippedCount++;
+        }
+      }
+
+      await gameRepository.updatePlayer(gameId, p.userId, { rank });
+      if (p.status !== 'LEFT') {
+        activeUserIds.push(p.userId);
+      }
+
+      // Record history with complete breakdown
       await historyRepository.create({
         userId: p.userId,
         gameId,
@@ -443,6 +528,9 @@ export class GameService {
         rank,
         roundReached: p.currentRound,
         totalRounds: game.numberOfSongs,
+        correctCount,
+        wrongCount,
+        skippedCount,
         totalThinkingTime: p.totalThinkingTime,
         status: isWinner ? 'WINNER' : (p.status === 'LEFT' ? 'LEFT' : 'COMPLETED')
       });
@@ -452,27 +540,39 @@ export class GameService {
         score: p.score,
         isWin: isWinner,
         thinkingTime: p.totalThinkingTime,
+        songsGuessed: correctCount,
         category: game.category
       });
     }
 
-    // Commit Recently Played only if game finished normally
-    await recentlyPlayedService.commitPlayedTracks(activeUserIds, playedTracks, 'MULTIPLAYER', game.category);
+    if (activeUserIds.length > 0 && playedTracks.length > 0) {
+      await recentlyPlayedService.commitPlayedTracks(activeUserIds, playedTracks, 'MULTIPLAYER', game.category);
+    }
 
     return await gameRepository.findById(gameId);
   }
 
   async checkAndFinishMultiplayerGame(gameId) {
     const game = await gameRepository.findById(gameId);
+    if (!game || game.status !== 'PLAYING') return game;
+
     const players = await gameRepository.getPlayersByGame(gameId);
     const activePlayers = players.filter(p => p.status !== 'LEFT');
 
-    // If only 1 active player left, they automatically win! (Section 43)
-    if (activePlayers.length <= 1 && players.length > 1) {
+    if (activePlayers.length === 0) {
+      await gameRepository.update(gameId, {
+        status: 'ABANDONED',
+        finishedAt: new Date()
+      });
+      return await gameRepository.findById(gameId);
+    }
+
+    // If only 1 active player left in a multiplayer match, they automatically win!
+    if (activePlayers.length === 1 && players.length > 1) {
       return await this.finishMultiplayerGame(gameId);
     }
 
-    // Check if all players completed all songs
+    // Check if all active players completed all songs
     const allCompleted = activePlayers.every(p => p.currentRound >= game.numberOfSongs && p.status !== 'THINKING');
     if (allCompleted) {
       return await this.finishMultiplayerGame(gameId);
@@ -482,14 +582,33 @@ export class GameService {
   }
 
   /**
+   * Retrieves the active WAITING/STARTING/PLAYING game for a user (if any)
+   */
+  async getActiveGame(userId) {
+    const activeGame = await gameRepository.findActiveGameForUser(userId);
+    if (!activeGame) return null;
+
+    if (activeGame.status === 'WAITING') {
+      const ageMs = Date.now() - new Date(activeGame.updatedAt).getTime();
+      if (ageMs > 60 * 60 * 1000) {
+        await gameRepository.update(activeGame.id, { status: 'ABANDONED', finishedAt: new Date() });
+        return null;
+      }
+    }
+
+    return await this.getGameState(activeGame.id, userId);
+  }
+
+  /**
    * Retrieves full game state for client view
    */
   async getGameState(gameId, userId) {
     const game = await gameRepository.findById(gameId);
     if (!game) return null;
 
+    const rounds = [...(game.rounds || [])].sort((a, b) => a.roundNumber - b.roundNumber);
     const player = game.players?.find(p => p.userId === userId) || null;
-    const currentRoundObj = game.rounds?.find(r => r.roundNumber === (player ? player.currentRound : game.currentRound));
+    const currentRoundObj = rounds.find(r => r.roundNumber === (player ? player.currentRound : game.currentRound));
 
     // Sanitized track metadata for client during play (hide title & artist until round over)
     const isRoundOver = player ? (player.status === 'GUESSED' || player.status === 'WRONG' || player.status === 'SKIPPED') : false;
@@ -500,14 +619,12 @@ export class GameService {
         id: currentRoundObj.track.id,
         spotifyId: currentRoundObj.track.spotifyId,
         previewUrl: currentRoundObj.track.previewUrl,
-        // Only show title & artist & art if round is finished or game is finished!
         title: (isRoundOver || game.status === 'FINISHED') ? currentRoundObj.track.title : '???',
         artist: (isRoundOver || game.status === 'FINISHED') ? currentRoundObj.track.artist : '???',
         albumArt: (isRoundOver || game.status === 'FINISHED') ? currentRoundObj.track.albumArt : null
       };
     }
 
-    // Leaderboard sorted by score DESC, thinkingTime ASC
     const leaderboard = (game.players || [])
       .map(p => ({
         userId: p.userId,
@@ -517,11 +634,60 @@ export class GameService {
         status: p.status,
         connectionStatus: p.connectionStatus,
         totalThinkingTime: p.totalThinkingTime,
+        currentRound: p.currentRound,
         rank: p.rank,
         isReady: !!p.isReady,
-        isHost: !!p.isHost
+        isHost: !!p.isHost,
+        createdAt: p.createdAt
       }))
-      .sort((a, b) => b.score - a.score || a.totalThinkingTime - b.totalThinkingTime);
+      .sort((a, b) => {
+        if (game.status === 'WAITING') {
+          return (b.isHost ? 1 : 0) - (a.isHost ? 1 : 0) || new Date(a.createdAt) - new Date(b.createdAt);
+        }
+        const aLeft = a.status === 'LEFT' ? 1 : 0;
+        const bLeft = b.status === 'LEFT' ? 1 : 0;
+        if (aLeft !== bLeft) return aLeft - bLeft;
+        return b.score - a.score || a.totalThinkingTime - b.totalThinkingTime;
+      })
+      .map(({ createdAt, ...entry }) => entry);
+
+    const isWaitingForOthers = Boolean(
+      game.mode === 'MULTIPLAYER' &&
+      game.status === 'PLAYING' &&
+      player &&
+      player.currentRound >= game.numberOfSongs &&
+      player.status !== 'THINKING' &&
+      player.status !== 'LEFT'
+    );
+
+    // Include complete ordered track list when game is FINISHED (for FinalResultPage & ShareInstagramModal)
+    let tracks = [];
+    if (game.status === 'FINISHED') {
+      tracks = await Promise.all(rounds.map(async (r) => {
+        let isCorrect = false;
+        let userResult = 'SKIPPED';
+        if (userId) {
+          const guesses = await gameRepository.getGuessesForRound(r.id, userId);
+          if (guesses.some(g => g.isCorrect)) {
+            isCorrect = true;
+            userResult = 'GUESSED';
+          } else if (guesses.length >= 3) {
+            userResult = 'WRONG';
+          }
+        }
+        return {
+          roundNumber: r.roundNumber,
+          id: r.track?.id || r.trackId,
+          spotifyId: r.track?.spotifyId || null,
+          title: r.track?.title || 'Unknown Track',
+          artist: r.track?.artist || 'Unknown Artist',
+          album: r.track?.album || null,
+          albumArt: r.track?.albumArt || null,
+          isCorrect,
+          userResult
+        };
+      }));
+    }
 
     return {
       id: game.id,
@@ -543,8 +709,10 @@ export class GameService {
         roundThinkingTime: player.roundThinkingTime
       } : null,
       currentTrack: trackInfo,
-      gameTrackIds: (game.rounds || []).map(r => r.trackId).filter(Boolean),
+      gameTrackIds: rounds.map(r => r.trackId).filter(Boolean),
+      tracks,
       leaderboard,
+      isWaitingForOthers,
       isFinished: game.status === 'FINISHED'
     };
   }

@@ -42,6 +42,11 @@ Game.init({
     defaultValue: 'WAITING',
     allowNull: false
   },
+  maxPlayers: {
+    type: DataTypes.INTEGER,
+    defaultValue: 8,
+    allowNull: false
+  },
   hostId: {
     type: DataTypes.UUID,
     allowNull: false

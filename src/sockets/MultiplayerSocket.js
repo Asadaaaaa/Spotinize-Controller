@@ -1,6 +1,8 @@
 import { matchmakingService } from '../services/MatchmakingService.js';
 import { gameService } from '../services/GameService.js';
 import { gameRepository } from '../repositories/GameRepository.js';
+import { reconnectService } from '../services/ReconnectService.js';
+import { broadcastLobbyUpdate, broadcastLeaveOutcome } from './socketBroadcaster.js';
 
 export class MultiplayerSocket {
   constructor(io) {
@@ -8,59 +10,75 @@ export class MultiplayerSocket {
   }
 
   registerEvents(socket) {
+    const requireSocketAuth = () => {
+      if (!socket.authenticated || !socket.userId) {
+        socket.emit('error', { message: 'Autentikasi socket diperlukan.' });
+        return false;
+      }
+      return true;
+    };
+
     // Join room channel
-    socket.on('game:join_room', async ({ gameId, userId }) => {
+    socket.on('game:join_room', async ({ gameId } = {}) => {
       try {
+        if (!requireSocketAuth() || !gameId) return;
+        const userId = socket.userId;
+
+        if (socket.gameId && socket.gameId !== gameId) {
+          socket.leave(`game:${socket.gameId}`);
+        }
+
         socket.join(`game:${gameId}`);
-        socket.userId = userId;
         socket.gameId = gameId;
 
-        const players = await gameRepository.getPlayersByGame(gameId);
-        const playerList = players.map(p => ({
-          userId: p.userId,
-          displayName: p.user?.displayName || 'Player',
-          avatarUrl: p.user?.avatarUrl || null,
-          isReady: !!p.isReady,
-          isHost: !!p.isHost
-        }));
+        const prePlayer = await gameRepository.getPlayer(gameId, userId);
+        const wasDisconnected = prePlayer?.connectionStatus === 'DISCONNECTED';
 
-        this.io.to(`game:${gameId}`).emit('lobby:update', {
-          players: playerList
-        });
-        this.io.to(`game:${gameId}`).emit('game:player_joined', {
-          players: playerList
-        });
+        // Cancel any pending disconnect grace timer on rejoin/refresh
+        const restored = await reconnectService.handleReconnect(gameId, userId);
+        const game = await gameRepository.findById(gameId);
+
+        if (game?.status === 'WAITING') {
+          await broadcastLobbyUpdate(this.io, gameId);
+        } else if (game?.status === 'PLAYING' && restored && wasDisconnected) {
+          this.io.to(`game:${gameId}`).emit('player:status_change', {
+            userId,
+            connectionStatus: 'CONNECTED'
+          });
+        }
       } catch (err) {
         socket.emit('error', { message: err.message });
+      }
+    });
+
+    // Leave room channel cleanly without mutating match membership
+    socket.on('game:leave_room', ({ gameId } = {}) => {
+      const targetId = gameId || socket.gameId;
+      if (!targetId) return;
+      socket.leave(`game:${targetId}`);
+      if (socket.gameId === targetId) {
+        socket.gameId = null;
       }
     });
 
     // Player toggles ready status
-    socket.on('player:ready', async ({ gameId, userId }) => {
+    socket.on('player:ready', async ({ gameId } = {}, ack) => {
       try {
-        await matchmakingService.toggleReady(gameId, userId);
-        const players = await gameRepository.getPlayersByGame(gameId);
-        
-        const playerList = players.map(p => ({
-          userId: p.userId,
-          displayName: p.user?.displayName || 'Player',
-          avatarUrl: p.user?.avatarUrl || null,
-          isReady: !!p.isReady,
-          isHost: !!p.isHost
-        }));
-
-        this.io.to(`game:${gameId}`).emit('lobby:update', {
-          players: playerList
-        });
+        if (!requireSocketAuth() || !gameId) return;
+        await matchmakingService.toggleReady(gameId, socket.userId);
+        await broadcastLobbyUpdate(this.io, gameId);
+        if (typeof ack === 'function') ack({ ok: true });
       } catch (err) {
+        if (typeof ack === 'function') ack({ ok: false, error: err.message });
         socket.emit('error', { message: err.message });
       }
     });
 
-    // Host starts multiplayer game
-    socket.on('game:start', async ({ gameId, hostId }) => {
+    // Host starts multiplayer game (guarded by atomic STARTING lock)
+    socket.on('game:start', async ({ gameId } = {}) => {
       try {
-        await gameService.startMultiplayerGame(gameId, hostId);
+        if (!requireSocketAuth() || !gameId) return;
+        await gameService.startMultiplayerGame(gameId, socket.userId);
         this.io.to(`game:${gameId}`).emit('game:started', {
           gameId,
           status: 'PLAYING',
@@ -72,42 +90,29 @@ export class MultiplayerSocket {
     });
 
     // Player voluntarily leaves
-    socket.on('game:leave', async ({ gameId, userId }) => {
+    socket.on('game:leave', async ({ gameId } = {}) => {
       try {
-        await matchmakingService.leaveRoom(gameId, userId);
+        if (!requireSocketAuth() || !gameId) return;
+        const userId = socket.userId;
+        const outcome = await matchmakingService.leaveRoom(gameId, userId);
         socket.leave(`game:${gameId}`);
-
-        this.io.to(`game:${gameId}`).emit('player:left', { userId });
-
-        const updatedState = await gameService.getGameState(gameId, userId);
-        if (updatedState) {
-          this.io.to(`game:${gameId}`).emit('ranking:update', {
-            leaderboard: updatedState.leaderboard
-          });
-
-          // Check if only 1 player remains -> auto winner!
-          const activePlayers = updatedState.leaderboard.filter(p => p.status !== 'LEFT');
-          if (activePlayers.length === 1) {
-            await gameService.finishMultiplayerGame(gameId);
-            this.io.to(`game:${gameId}`).emit('game:finish', {
-              leaderboard: updatedState.leaderboard,
-              winner: activePlayers[0]
-            });
-          }
+        if (socket.gameId === gameId) {
+          socket.gameId = null;
         }
+        await broadcastLeaveOutcome(this.io, gameId, userId, outcome.previousStatus);
       } catch (err) {
         socket.emit('error', { message: err.message });
       }
     });
 
     // Direct realtime room invitation
-    socket.on('invite:send', async ({ targetUserId, roomCode, gameId, hostId, hostName, hostAvatar, category }) => {
+    socket.on('invite:send', async ({ targetUserId, roomCode, gameId, hostName, hostAvatar, category } = {}) => {
       try {
-        if (!targetUserId || !roomCode) return;
+        if (!requireSocketAuth() || !targetUserId || !roomCode) return;
         this.io.to(`user:${targetUserId}`).emit('invite:received', {
           roomCode,
           gameId,
-          hostId,
+          hostId: socket.userId,
           hostName,
           hostAvatar,
           category: category || 'Global Trends',

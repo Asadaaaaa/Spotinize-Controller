@@ -2,6 +2,7 @@ import axios from 'axios';
 import spotifyConfig from '../config/spotify.js';
 import { SearchCache } from '../models/index.js';
 import { imageCacheService } from './ImageCacheService.js';
+import { Normalizer } from '../utils/Normalizer.js';
 
 export class SpotifyService {
   constructor() {
@@ -622,91 +623,171 @@ export class SpotifyService {
     }
   }
 
+  _normalizeArtistToken(str) {
+    if (!str || typeof str !== 'string') return '';
+    return str
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^\w\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  _isStrictArtistMatch(candidateArtistStr, targetQuery) {
+    const normTarget = this._normalizeArtistToken(targetQuery);
+    if (!normTarget || !candidateArtistStr) return false;
+    const normTargetNoThe = normTarget.replace(/^the\s+/, '');
+
+    const rawTokens = candidateArtistStr
+      .split(/,|&|\band\b|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\bwith\b|\bx\b|\//i)
+      .map(s => this._normalizeArtistToken(s))
+      .filter(Boolean);
+
+    const fullNorm = this._normalizeArtistToken(candidateArtistStr);
+    if (fullNorm && !rawTokens.includes(fullNorm)) {
+      rawTokens.unshift(fullNorm);
+    }
+
+    return rawTokens.some(tok => {
+      if (tok === normTarget) return true;
+      const tokNoThe = tok.replace(/^the\s+/, '');
+      return normTargetNoThe.length >= 3 && tokNoThe === normTargetNoThe;
+    });
+  }
+
+  _isUnwantedArtistTrack(trackName = '', collectionName = '', artistName = '', targetQuery = '') {
+    const haystack = `${trackName} ${collectionName} ${artistName}`.toLowerCase();
+    const targetLower = (targetQuery || '').toLowerCase();
+    const bannedTerms = [
+      'karaoke', 'tribute', 'lullaby', 'cover', 'originally performed',
+      'made famous', 'in the style of', '8-bit', 'ringtone', 'music box',
+      'instrumental version'
+    ];
+    for (const term of bannedTerms) {
+      if (haystack.includes(term) && !targetLower.includes(term)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _artistTrackPriority(track) {
+    let score = track.previewUrl ? 100 : 0;
+    const titleLower = (track.title || '').toLowerCase();
+    if (!/\b(live|remaster|acoustic|remix|sped up|slowed|demo|instrumental)\b/i.test(titleLower)) {
+      score += 20;
+    }
+    return score;
+  }
+
   async getTopTracks(category = 'Global Trends', artistQuery = null, accessToken = null) {
     if (category === 'Artist' && artistQuery) {
       const q = artistQuery.trim();
       let artistTracks = [];
 
-      // 1. Fetch comprehensive artist songs via iTunes Search API (up to 50 tracks)
+      const mapItunesItem = (item) => ({
+        spotifyId: 'itunes_' + item.trackId,
+        title: item.trackName,
+        artist: item.artistName,
+        primaryArtist: item.artistName,
+        album: item.collectionName,
+        albumArt: item.artworkUrl100 ? item.artworkUrl100.replace('100x100bb', '600x600bb') : null,
+        previewUrl: item.previewUrl,
+        durationMs: item.trackTimeMillis,
+        category: 'Artist'
+      });
+
+      const filterItunesResults = (items = []) => items.filter(t =>
+        Boolean(t.previewUrl) &&
+        this._isStrictArtistMatch(t.artistName, q) &&
+        !this._isUnwantedArtistTrack(t.trackName, t.collectionName, t.artistName, q)
+      );
+
+      // 1. Fetch strict artist songs via iTunes Search API (ID first, then US if < 15)
       try {
-        const itunesRes = await axios.get('https://itunes.apple.com/search', {
-          params: { term: q, entity: 'song', limit: 50 },
-          timeout: 4000
+        const idRes = await axios.get('https://itunes.apple.com/search', {
+          params: { term: q, media: 'music', entity: 'song', attribute: 'artistTerm', country: 'ID', limit: 50 },
+          timeout: 4500
         });
-        if (itunesRes.data?.results?.length > 0) {
-          const lowerQ = q.toLowerCase();
-          const filtered = itunesRes.data.results.filter(t => 
-            t.artistName?.toLowerCase().includes(lowerQ) ||
-            lowerQ.includes(t.artistName?.toLowerCase())
-          );
-          
-          artistTracks = (filtered.length >= 5 ? filtered : itunesRes.data.results).map(item => ({
-            spotifyId: 'itunes_' + item.trackId,
-            title: item.trackName,
-            artist: item.artistName,
-            primaryArtist: item.artistName,
-            album: item.collectionName,
-            albumArt: item.artworkUrl100 ? item.artworkUrl100.replace('100x100bb', '600x600bb') : null,
-            previewUrl: item.previewUrl,
-            durationMs: item.trackTimeMillis,
-            category: 'Artist'
-          }));
+        const idFiltered = filterItunesResults(idRes.data?.results || []);
+        artistTracks = idFiltered.map(mapItunesItem);
+
+        if (artistTracks.length < 15) {
+          const usRes = await axios.get('https://itunes.apple.com/search', {
+            params: { term: q, media: 'music', entity: 'song', attribute: 'artistTerm', country: 'US', limit: 50 },
+            timeout: 4500
+          });
+          const usFiltered = filterItunesResults(usRes.data?.results || []);
+          artistTracks = [...artistTracks, ...usFiltered.map(mapItunesItem)];
         }
       } catch (err) {
         console.warn('[SpotifyService] iTunes artist track fetch notice:', err.message);
       }
 
-      // 2. Secondary Spotify search if needed
-      if (artistTracks.length < 5) {
-        const token = (accessToken && !accessToken.startsWith('mock_')) 
-          ? accessToken 
+      // 2. Secondary Spotify search with strict artist filter if needed
+      if (artistTracks.length < 10) {
+        const token = (accessToken && !accessToken.startsWith('mock_'))
+          ? accessToken
           : await this.getAppAccessToken();
 
         if (token) {
           try {
             const spRes = await axios.get('https://api.spotify.com/v1/search', {
-              params: { q, type: 'track', limit: 10 },
+              params: { q: `artist:"${q}"`, type: 'track', limit: 25 },
               headers: { Authorization: `Bearer ${token}` },
               timeout: 4000
             });
             if (spRes.data?.tracks?.items?.length > 0) {
-              const spTracks = spRes.data.tracks.items.map(item => ({
-                spotifyId: item.id,
-                title: item.name,
-                artist: item.artists.map(a => a.name).join(', '),
-                primaryArtist: item.artists[0]?.name || '',
-                album: item.album.name,
-                albumArt: item.album.images[0]?.url || item.album.images[1]?.url || null,
-                previewUrl: item.preview_url,
-                durationMs: item.duration_ms,
-                category: 'Artist'
-              }));
+              const spTracks = spRes.data.tracks.items
+                .filter(item => {
+                  const fullArtist = item.artists.map(a => a.name).join(', ');
+                  const matchesAny = item.artists.some(a => this._isStrictArtistMatch(a.name, q)) ||
+                    this._isStrictArtistMatch(fullArtist, q);
+                  return matchesAny && !this._isUnwantedArtistTrack(item.name, item.album?.name, fullArtist, q);
+                })
+                .map(item => ({
+                  spotifyId: item.id,
+                  title: item.name,
+                  artist: item.artists.map(a => a.name).join(', '),
+                  primaryArtist: item.artists[0]?.name || '',
+                  album: item.album.name,
+                  albumArt: item.album.images[0]?.url || item.album.images[1]?.url || null,
+                  previewUrl: item.preview_url,
+                  durationMs: item.duration_ms,
+                  category: 'Artist'
+                }));
               artistTracks = [...artistTracks, ...spTracks];
             }
           } catch (err) {}
         }
       }
 
-      // 3. Match from local fallback
-      const localMatches = this.fallbackTracks.filter(t => 
-        t.artist.toLowerCase().includes(q.toLowerCase())
-      );
+      // 3. Match from local fallback using strict artist matching
+      const localMatches = this.fallbackTracks
+        .filter(t =>
+          this._isStrictArtistMatch(t.artist, q) &&
+          !this._isUnwantedArtistTrack(t.title, t.album, t.artist, q)
+        )
+        .map(t => ({ ...t, category: 'Artist' }));
       artistTracks = [...artistTracks, ...localMatches];
 
-      // Ensure uniqueness by artist + title
-      const seen = new Set();
-      const uniqueTracks = [];
+      // 4. Deduplicate by normalized song title (prefer tracks with previewUrl & original versions)
+      const trackByNormTitle = new Map();
       for (const t of artistTracks) {
-        const key = `${t.artist.toLowerCase()}_${t.title.toLowerCase()}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          uniqueTracks.push(t);
+        const normTitle = Normalizer.normalizeTitle(t.title) || (t.title || '').toLowerCase().trim();
+        if (!normTitle) continue;
+        const existing = trackByNormTitle.get(normTitle);
+        if (!existing || this._artistTrackPriority(t) > this._artistTrackPriority(existing)) {
+          trackByNormTitle.set(normTitle, t);
         }
       }
 
+      const uniqueTracks = Array.from(trackByNormTitle.values());
       if (uniqueTracks.length > 0) {
         return await imageCacheService.bulkCacheImages(uniqueTracks);
       }
+      return [];
     }
 
     // 1. Nostalgia < 2000 Category
