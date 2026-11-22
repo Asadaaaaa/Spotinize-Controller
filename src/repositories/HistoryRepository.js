@@ -17,20 +17,39 @@ export class HistoryRepository {
     const histories = await GameHistory.findAll({ where: { userId } });
     const totalGames = histories.length;
     if (totalGames === 0) {
-      return { totalGames: 0, totalScore: 0, bestScore: 0, avgScore: 0, winCount: 0, winRate: 0 };
+      return {
+        totalGames: 0,
+        totalScore: 0,
+        bestScore: 0,
+        avgScore: 0,
+        totalSongsGuessed: 0,
+        totalSongsPlayed: 0,
+        guessRate: 0,
+        winRate: 0
+      };
     }
 
-    const totalScore = histories.reduce((sum, h) => sum + h.score, 0);
-    const bestScore = Math.max(...histories.map(h => h.score));
-    const winCount = histories.filter(h => h.status === 'WINNER' || h.rank === 1).length;
+    const totalScore = histories.reduce((sum, h) => sum + (h.score || 0), 0);
+    const bestScore = Math.max(...histories.map(h => h.score || 0));
+    const totalSongsGuessed = histories.reduce((sum, h) => sum + (h.correctCount || 0), 0);
+    const totalSongsPlayed = histories.reduce((sum, h) => {
+      const recordedRounds = (h.correctCount || 0) + (h.wrongCount || 0) + (h.skippedCount || 0);
+      const songsInGame = h.status === 'LEFT' ? recordedRounds : Math.max(recordedRounds, h.totalRounds || 0);
+      return sum + songsInGame;
+    }, 0);
+    const guessRate = totalSongsPlayed > 0
+      ? Math.min(100, Math.round((totalSongsGuessed / totalSongsPlayed) * 100))
+      : 0;
 
     return {
       totalGames,
       totalScore,
       bestScore,
       avgScore: Math.round(totalScore / totalGames),
-      winCount,
-      winRate: Math.round((winCount / totalGames) * 100)
+      totalSongsGuessed,
+      totalSongsPlayed,
+      guessRate,
+      winRate: guessRate
     };
   }
 }

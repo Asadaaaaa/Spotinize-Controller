@@ -1,6 +1,6 @@
 import axios from 'axios';
 import spotifyConfig from '../config/spotify.js';
-import { SearchCache } from '../models/index.js';
+import { SearchCache, Track, YearlyHit } from '../models/index.js';
 import { imageCacheService } from './ImageCacheService.js';
 import { Normalizer } from '../utils/Normalizer.js';
 
@@ -477,11 +477,20 @@ export class SpotifyService {
       });
 
       if (dbCached && dbCached.results) {
-        // If results exist in DB and not expired, return immediately from database
+        // If results exist in DB and not expired, return immediately from database (ensuring images are cached on disk)
         const isExpired = dbCached.expiresAt && new Date(dbCached.expiresAt) < new Date();
         if (!isExpired) {
           const parsed = typeof dbCached.results === 'string' ? JSON.parse(dbCached.results) : dbCached.results;
-          return (parsed || []).slice(0, effectiveLimit);
+          const list = parsed || [];
+          const hasUncachedArt = list.some(t => t.albumArt && !imageCacheService.isLocalCachedImage(t.albumArt));
+          if (!hasUncachedArt) {
+            return list.slice(0, effectiveLimit);
+          }
+          const enriched = await imageCacheService.bulkCacheImages(list);
+          await dbCached.update({ results: enriched }).catch(() => {});
+          if (enriched.some(t => imageCacheService.isLocalCachedImage(t.albumArt))) {
+            return enriched.slice(0, effectiveLimit);
+          }
         }
       }
     } catch (err) {
@@ -790,10 +799,28 @@ export class SpotifyService {
       return [];
     }
 
-    // 1. Nostalgia < 2000 Category
+    // 1. Nostalgia < 2000 Category (from MySQL `tracks` + curated fallback)
     if (category === 'Nostalgia < 2000' || category === 'Nostalgia' || category === '2000s Below') {
-      let nostalgiaTracks = this.fallbackTracks.filter(t => t.category === 'Nostalgia < 2000');
-      
+      let dbNostalgia = [];
+      try {
+        const rows = await Track.findAll({ where: { category: 'Nostalgia < 2000' }, limit: 150 });
+        dbNostalgia = rows.map(r => ({
+          id: r.id,
+          spotifyId: r.spotifyId,
+          title: r.title,
+          artist: r.artist,
+          primaryArtist: r.artist?.split(',')[0]?.trim() || r.artist,
+          album: r.album,
+          albumArt: r.albumArt,
+          previewUrl: r.previewUrl,
+          category: 'Nostalgia < 2000',
+          region: r.spotifyId?.startsWith('nostalgia_id_') ? 'ID' : 'GLOBAL'
+        }));
+      } catch (e) {}
+
+      const localNostalgia = this.fallbackTracks.filter(t => t.category === 'Nostalgia < 2000');
+      let nostalgiaTracks = this._mergeUniqueTracks(dbNostalgia, localNostalgia);
+
       const subChoice = (artistQuery || '').toUpperCase().trim();
       if (subChoice === 'INDO' || subChoice === 'ID' || subChoice === 'INDONESIA') {
         nostalgiaTracks = nostalgiaTracks.filter(t => t.region === 'ID');
@@ -802,6 +829,151 @@ export class SpotifyService {
       }
       
       return await imageCacheService.bulkCacheImages(nostalgiaTracks);
+    }
+
+    // 1.5 Genre Category (Dropdown of all genres)
+    if (category === 'Genre') {
+      const subChoice = (artistQuery || 'ALL').toUpperCase().trim();
+      const cacheKey = `Genre_${subChoice}`;
+
+      if (this.dailyCharts[cacheKey]?.data?.length > 0 && Date.now() < this.dailyCharts[cacheKey].expiresAt) {
+        return this.dailyCharts[cacheKey].data;
+      }
+
+      const DEEZER_GENRE_MAP = {
+        ALL: 0,
+        POP: 132,
+        HIPHOP: 116,
+        RNB: 165,
+        ROCK: 152,
+        ALTERNATIVE: 85,
+        DANCE: 113,
+        JAZZ: 129
+      };
+
+      let liveTracks = [];
+      try {
+        if (DEEZER_GENRE_MAP[subChoice] !== undefined) {
+          liveTracks = await this._fetchDeezerGenreChart(DEEZER_GENRE_MAP[subChoice], 'Genre');
+        } else if (subChoice === 'KPOP') {
+          liveTracks = await this._fetchItunesRssChart('kr', 'Genre');
+        } else if (subChoice === 'JPOP') {
+          liveTracks = await this._fetchItunesRssChart('jp', 'Genre');
+        }
+      } catch (err) {
+        console.warn(`[SpotifyService] Genre live fetch notice (${subChoice}):`, err.message);
+      }
+
+      let dbGenreTracks = [];
+      try {
+        const rows = await Track.findAll({
+          where: subChoice === 'ALL' ? { category: 'Genre' } : { genre: subChoice },
+          limit: 100
+        });
+        dbGenreTracks = rows.map(r => ({
+          id: r.id,
+          spotifyId: r.spotifyId,
+          title: r.title,
+          artist: r.artist,
+          primaryArtist: r.artist?.split(',')[0]?.trim() || r.artist,
+          album: r.album,
+          albumArt: r.albumArt,
+          previewUrl: r.previewUrl,
+          category: 'Genre',
+          genre: r.genre,
+          releaseYear: r.releaseYear
+        }));
+      } catch (dbErr) {
+        console.warn('[SpotifyService] DB genre fallback notice:', dbErr.message);
+      }
+
+      const combined = this._mergeUniqueTracks(liveTracks, dbGenreTracks);
+      if (combined.length > 0) {
+        const cached = await imageCacheService.bulkCacheImages(combined);
+        this.dailyCharts[cacheKey] = { data: cached, expiresAt: Date.now() + 12 * 3600 * 1000 };
+        return cached;
+      }
+      return [];
+    }
+
+    // 1.6 Era & Tahun Category (Dropdown of years: currentYear down to 1980)
+    if (category === 'Era & Tahun') {
+      const subChoice = (artistQuery || String(new Date().getFullYear())).toUpperCase().trim();
+      const cacheKey = `Era_${subChoice}`;
+
+      if (this.dailyCharts[cacheKey]?.data?.length > 0 && Date.now() < this.dailyCharts[cacheKey].expiresAt) {
+        return this.dailyCharts[cacheKey].data;
+      }
+
+      const curated = this.fallbackTracks.filter(t => t.category === 'Era & Tahun' && t.subCategory === subChoice);
+      let dbYearTracks = [];
+      const parsedYear = parseInt(subChoice, 10);
+      if (!Number.isNaN(parsedYear)) {
+        try {
+          const yearlyHit = await YearlyHit.findOne({
+            where: { year: parsedYear },
+            include: [{ model: Track, as: 'tracks' }]
+          });
+          const rows = yearlyHit?.tracks?.length
+            ? yearlyHit.tracks
+            : await Track.findAll({ where: { releaseYear: parsedYear }, limit: 120 });
+          dbYearTracks = rows.map(r => ({
+            id: r.id,
+            spotifyId: r.spotifyId,
+            title: r.title,
+            artist: r.artist,
+            primaryArtist: r.artist?.split(',')[0]?.trim() || r.artist,
+            album: r.album,
+            albumArt: r.albumArt,
+            previewUrl: r.previewUrl,
+            category: 'Era & Tahun',
+            releaseYear: r.releaseYear,
+            yearlyHitId: r.yearlyHitId
+          }));
+        } catch (dbErr) {
+          console.warn('[SpotifyService] DB yearly hits notice:', dbErr.message);
+        }
+      }
+
+      let liveTracks = [];
+
+      if (subChoice === '2026' || subChoice === '2025') {
+        const [usRss, idRss] = await Promise.all([
+          this._fetchItunesRssChart('us', 'Era & Tahun'),
+          this._fetchItunesRssChart('id', 'Era & Tahun')
+        ]);
+        liveTracks = [...usRss, ...idRss];
+      } else if (/^(197\d|198\d|199\d|20[0-2]\d)$/.test(subChoice) && (curated.length + dbYearTracks.length) < 10) {
+        try {
+          const itunesRes = await axios.get('https://itunes.apple.com/search', {
+            params: { term: subChoice, media: 'music', entity: 'song', limit: 40 },
+            timeout: 4500
+          });
+          liveTracks = (itunesRes.data?.results || [])
+            .filter(item => Boolean(item.previewUrl))
+            .map(item => ({
+              spotifyId: 'itunes_' + item.trackId,
+              title: item.trackName,
+              artist: item.artistName,
+              primaryArtist: item.artistName,
+              album: item.collectionName,
+              albumArt: item.artworkUrl100 ? item.artworkUrl100.replace('100x100bb', '600x600bb') : null,
+              previewUrl: item.previewUrl,
+              durationMs: item.trackTimeMillis,
+              category: 'Era & Tahun'
+            }));
+        } catch (err) {
+          console.warn(`[SpotifyService] Year ${subChoice} iTunes fetch notice:`, err.message);
+        }
+      }
+
+      const combined = this._mergeUniqueTracks([...dbYearTracks, ...curated], liveTracks);
+      if (combined.length > 0) {
+        const cached = await imageCacheService.bulkCacheImages(combined);
+        this.dailyCharts[cacheKey] = { data: cached, expiresAt: Date.now() + 12 * 3600 * 1000 };
+        return cached;
+      }
+      return [];
     }
 
     // 2. Dynamic Daily Chart Fetching for Global Trends & Indonesia Trends
@@ -846,6 +1018,24 @@ export class SpotifyService {
       } catch (err) {
         console.warn(`[SpotifyService] Daily chart fallback notice for ${chartKey}:`, err.message);
       }
+
+      // DB fallback for Indonesia Trends / Global Trends
+      try {
+        const dbRows = await Track.findAll({ where: { category: chartKey }, limit: 150 });
+        if (dbRows.length > 0) {
+          return dbRows.map(r => ({
+            id: r.id,
+            spotifyId: r.spotifyId,
+            title: r.title,
+            artist: r.artist,
+            primaryArtist: r.artist?.split(',')[0]?.trim() || r.artist,
+            album: r.album,
+            albumArt: r.albumArt,
+            previewUrl: r.previewUrl,
+            category: chartKey
+          }));
+        }
+      } catch (e) {}
     }
 
     if (category === 'Indonesia Trends') {
@@ -970,6 +1160,74 @@ export class SpotifyService {
       console.warn(`[SpotifyService] Secondary daily chart fetch error for ${countryCode}:`, err.message);
     }
     return [];
+  }
+
+  _mergeUniqueTracks(primary = [], secondary = []) {
+    const seen = new Set();
+    const combined = [];
+    for (const t of [...primary, ...secondary]) {
+      const key = `${(t.title || '').toLowerCase().trim()}_${(t.artist || '').toLowerCase().trim()}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        combined.push(t);
+      }
+    }
+    return combined;
+  }
+
+  async _fetchDeezerGenreChart(genreId, categoryName = 'Genre') {
+    try {
+      const res = await axios.get(`https://api.deezer.com/chart/${genreId}/tracks`, {
+        params: { limit: 40 },
+        timeout: 4500
+      });
+      const items = res.data?.data || [];
+      return items
+        .filter(t => t.title && t.artist?.name)
+        .map(t => ({
+          spotifyId: `deezer_${t.id}`,
+          title: t.title,
+          artist: t.artist.name,
+          primaryArtist: t.artist.name,
+          album: t.album?.title || t.title,
+          albumArt: t.album?.cover_big || t.album?.cover_medium || null,
+          previewUrl: t.preview || null,
+          category: categoryName
+        }));
+    } catch (err) {
+      console.warn(`[SpotifyService] Deezer genre ${genreId} fetch notice:`, err.message);
+      return [];
+    }
+  }
+
+  async _fetchItunesRssChart(countryCode = 'us', categoryName = 'Global Trends') {
+    try {
+      const url = `https://itunes.apple.com/${countryCode}/rss/topsongs/limit=40/json`;
+      const res = await axios.get(url, { timeout: 4500 });
+      const entries = res.data?.feed?.entry;
+      if (!Array.isArray(entries)) return [];
+      return entries.map((e, idx) => {
+        const title = e['im:name']?.label || '';
+        const artist = e['im:artist']?.label || '';
+        const rawImg = e['im:image']?.[2]?.label || e['im:image']?.[1]?.label || null;
+        const albumArt = rawImg ? rawImg.replace(/\/\d+x\d+bb\./, '/600x600bb.') : null;
+        const previewUrl = e['link']?.find(l => l.attributes?.type?.includes('audio'))?.attributes?.href || null;
+        const trackId = e['id']?.attributes?.['im:id'] || `rss_${countryCode}_${idx}`;
+        return {
+          spotifyId: `rss_${countryCode}_${trackId}`,
+          title,
+          artist,
+          primaryArtist: artist.split('&')[0].split(',')[0].trim(),
+          album: e['im:collection']?.['im:name']?.label || title,
+          albumArt,
+          previewUrl,
+          category: categoryName
+        };
+      });
+    } catch (err) {
+      console.warn(`[SpotifyService] iTunes RSS ${countryCode} fetch notice:`, err.message);
+      return [];
+    }
   }
 
   _initFallbackArtists() {
@@ -1205,7 +1463,111 @@ export class SpotifyService {
       { spotifyId: 'tr_old_57', title: 'Take On Me', artist: 'a-ha', album: 'Hunting High and Low', albumArt: 'https://is1-ssl.mzstatic.com/image/thumb/Music124/v4/9e/a0/0b/9ea00b65-7489-ebba-bcf1-0e1a1204689b/0724354050454.jpg/600x600bb.jpg', category: 'Nostalgia < 2000', region: 'GLOBAL' },
       { spotifyId: 'tr_old_58', title: 'My Heart Will Go On', artist: 'Celine Dion', album: 'Let\'s Talk About Love', albumArt: 'https://is1-ssl.mzstatic.com/image/thumb/Music124/v4/9e/a0/0b/9ea00b65-7489-ebba-bcf1-0e1a1204689b/0724354050454.jpg/600x600bb.jpg', category: 'Nostalgia < 2000', region: 'GLOBAL' },
       { spotifyId: 'tr_old_59', title: 'Creep', artist: 'Radiohead', album: 'Pablo Honey', albumArt: 'https://is1-ssl.mzstatic.com/image/thumb/Music124/v4/9e/a0/0b/9ea00b65-7489-ebba-bcf1-0e1a1204689b/0724354050454.jpg/600x600bb.jpg', category: 'Nostalgia < 2000', region: 'GLOBAL' },
-      { spotifyId: 'tr_old_60', title: 'Hey Jude', artist: 'The Beatles', album: 'Hey Jude', albumArt: 'https://is1-ssl.mzstatic.com/image/thumb/Music124/v4/9e/a0/0b/9ea00b65-7489-ebba-bcf1-0e1a1204689b/0724354050454.jpg/600x600bb.jpg', category: 'Nostalgia < 2000', region: 'GLOBAL' }
+      { spotifyId: 'tr_old_60', title: 'Hey Jude', artist: 'The Beatles', album: 'Hey Jude', albumArt: 'https://is1-ssl.mzstatic.com/image/thumb/Music124/v4/9e/a0/0b/9ea00b65-7489-ebba-bcf1-0e1a1204689b/0724354050454.jpg/600x600bb.jpg', category: 'Nostalgia < 2000', region: 'GLOBAL' },
+
+      // ==========================================
+      // GENRE: INDIE INDONESIA
+      // ==========================================
+      { spotifyId: 'tr_ind_1', title: 'Satu Bulan', artist: 'Bernadya', album: 'Sialnya, Hidup Harus Tetap Berjalan', category: 'Genre', subCategory: 'INDIE_ID' },
+      { spotifyId: 'tr_ind_2', title: 'Evaluasi', artist: 'Hindia', album: 'Menari Dengan Bayangan', category: 'Genre', subCategory: 'INDIE_ID' },
+      { spotifyId: 'tr_ind_3', title: 'Rumah Ke Rumah', artist: 'Hindia', album: 'Menari Dengan Bayangan', category: 'Genre', subCategory: 'INDIE_ID' },
+      { spotifyId: 'tr_ind_4', title: 'Bertaut', artist: 'Nadin Amizah', album: 'Selamat Ulang Tahun', category: 'Genre', subCategory: 'INDIE_ID' },
+      { spotifyId: 'tr_ind_5', title: 'Sorai', artist: 'Nadin Amizah', album: 'Sorai', category: 'Genre', subCategory: 'INDIE_ID' },
+      { spotifyId: 'tr_ind_6', title: 'Hati-Hati di Jalan', artist: 'Tulus', album: 'Manusia', category: 'Genre', subCategory: 'INDIE_ID' },
+      { spotifyId: 'tr_ind_7', title: 'Monokrom', artist: 'Tulus', album: 'Monokrom', category: 'Genre', subCategory: 'INDIE_ID' },
+      { spotifyId: 'tr_ind_8', title: 'Lantas', artist: 'Juicy Luicy', album: 'Sentimental', category: 'Genre', subCategory: 'INDIE_ID' },
+      { spotifyId: 'tr_ind_9', title: 'Sialan', artist: 'Juicy Luicy, Adrian Khalif', album: 'Nonfiksi', category: 'Genre', subCategory: 'INDIE_ID' },
+      { spotifyId: 'tr_ind_10', title: 'To the Bone', artist: 'Pamungkas', album: 'Flying Solo', category: 'Genre', subCategory: 'INDIE_ID' },
+      { spotifyId: 'tr_ind_11', title: 'Kenangan Manis', artist: 'Pamungkas', album: 'Walk the Talk', category: 'Genre', subCategory: 'INDIE_ID' },
+      { spotifyId: 'tr_ind_12', title: 'Gala Bunga Matahari', artist: 'Sal Priadi', album: 'MARKERS AND SUCH PENS FLASHDISKS', category: 'Genre', subCategory: 'INDIE_ID' },
+
+      // ==========================================
+      // GENRE: K-POP (Fallback alongside iTunes KR)
+      // ==========================================
+      { spotifyId: 'tr_kp_1', title: 'Dynamite', artist: 'BTS', album: 'BE', category: 'Genre', subCategory: 'KPOP' },
+      { spotifyId: 'tr_kp_2', title: 'How You Like That', artist: 'BLACKPINK', album: 'THE ALBUM', category: 'Genre', subCategory: 'KPOP' },
+      { spotifyId: 'tr_kp_3', title: 'Super Shy', artist: 'NewJeans', album: 'Get Up', category: 'Genre', subCategory: 'KPOP' },
+      { spotifyId: 'tr_kp_4', title: 'APT.', artist: 'ROSE, Bruno Mars', album: 'rosie', category: 'Genre', subCategory: 'KPOP' },
+      { spotifyId: 'tr_kp_5', title: 'Seven', artist: 'Jung Kook', album: 'GOLDEN', category: 'Genre', subCategory: 'KPOP' },
+      { spotifyId: 'tr_kp_6', title: 'Supernova', artist: 'aespa', album: 'Armageddon', category: 'Genre', subCategory: 'KPOP' },
+      { spotifyId: 'tr_kp_7', title: 'Love Scenario', artist: 'iKON', album: 'Return', category: 'Genre', subCategory: 'KPOP' },
+      { spotifyId: 'tr_kp_8', title: 'Kill This Love', artist: 'BLACKPINK', album: 'KILL THIS LOVE', category: 'Genre', subCategory: 'KPOP' },
+
+      // ==========================================
+      // ERA & TAHUN: 2024
+      // ==========================================
+      { spotifyId: 'tr_2024_1', title: 'Espresso', artist: 'Sabrina Carpenter', album: 'Short n\' Sweet', category: 'Era & Tahun', subCategory: '2024' },
+      { spotifyId: 'tr_2024_2', title: 'BIRDS OF A FEATHER', artist: 'Billie Eilish', album: 'HIT ME HARD AND SOFT', category: 'Era & Tahun', subCategory: '2024' },
+      { spotifyId: 'tr_2024_3', title: 'Die With A Smile', artist: 'Lady Gaga, Bruno Mars', album: 'Die With A Smile', category: 'Era & Tahun', subCategory: '2024' },
+      { spotifyId: 'tr_2024_4', title: 'APT.', artist: 'ROSE, Bruno Mars', album: 'rosie', category: 'Era & Tahun', subCategory: '2024' },
+      { spotifyId: 'tr_2024_5', title: 'Good Luck, Babe!', artist: 'Chappell Roan', album: 'Good Luck, Babe!', category: 'Era & Tahun', subCategory: '2024' },
+      { spotifyId: 'tr_2024_6', title: 'Beautiful Things', artist: 'Benson Boone', album: 'Fireworks & Rollerblades', category: 'Era & Tahun', subCategory: '2024' },
+      { spotifyId: 'tr_2024_7', title: 'Satu Bulan', artist: 'Bernadya', album: 'Sialnya, Hidup Harus Tetap Berjalan', category: 'Era & Tahun', subCategory: '2024' },
+      { spotifyId: 'tr_2024_8', title: 'Gala Bunga Matahari', artist: 'Sal Priadi', album: 'MARKERS AND SUCH PENS FLASHDISKS', category: 'Era & Tahun', subCategory: '2024' },
+      { spotifyId: 'tr_2024_9', title: 'Not Like Us', artist: 'Kendrick Lamar', album: 'Not Like Us', category: 'Era & Tahun', subCategory: '2024' },
+      { spotifyId: 'tr_2024_10', title: 'we can\'t be friends', artist: 'Ariana Grande', album: 'eternal sunshine', category: 'Era & Tahun', subCategory: '2024' },
+
+      // ==========================================
+      // ERA & TAHUN: 2023
+      // ==========================================
+      { spotifyId: 'tr_2023_1', title: 'Flowers', artist: 'Miley Cyrus', album: 'Endless Summer Vacation', category: 'Era & Tahun', subCategory: '2023' },
+      { spotifyId: 'tr_2023_2', title: 'Kill Bill', artist: 'SZA', album: 'SOS', category: 'Era & Tahun', subCategory: '2023' },
+      { spotifyId: 'tr_2023_3', title: 'Cruel Summer', artist: 'Taylor Swift', album: 'Lover', category: 'Era & Tahun', subCategory: '2023' },
+      { spotifyId: 'tr_2023_4', title: 'vampire', artist: 'Olivia Rodrigo', album: 'GUTS', category: 'Era & Tahun', subCategory: '2023' },
+      { spotifyId: 'tr_2023_5', title: 'Sial', artist: 'Mahalini', album: 'Fabula', category: 'Era & Tahun', subCategory: '2023' },
+      { spotifyId: 'tr_2023_6', title: 'Komang', artist: 'Raim Laode', album: 'Komang', category: 'Era & Tahun', subCategory: '2023' },
+      { spotifyId: 'tr_2023_7', title: 'Seven', artist: 'Jung Kook', album: 'GOLDEN', category: 'Era & Tahun', subCategory: '2023' },
+      { spotifyId: 'tr_2023_8', title: 'greedy', artist: 'Tate McRae', album: 'THINK LATER', category: 'Era & Tahun', subCategory: '2023' },
+      { spotifyId: 'tr_2023_9', title: 'Cupid', artist: 'FIFTY FIFTY', album: 'The Beginning', category: 'Era & Tahun', subCategory: '2023' },
+      { spotifyId: 'tr_2023_10', title: 'Dance The Night', artist: 'Dua Lipa', album: 'Barbie The Album', category: 'Era & Tahun', subCategory: '2023' },
+
+      // ==========================================
+      // ERA & TAHUN: 2010S
+      // ==========================================
+      { spotifyId: 'tr_2010_1', title: 'Shape of You', artist: 'Ed Sheeran', album: 'Divide', category: 'Era & Tahun', subCategory: '2010S' },
+      { spotifyId: 'tr_2010_2', title: 'Uptown Funk', artist: 'Mark Ronson, Bruno Mars', album: 'Uptown Special', category: 'Era & Tahun', subCategory: '2010S' },
+      { spotifyId: 'tr_2010_3', title: 'Blank Space', artist: 'Taylor Swift', album: '1989', category: 'Era & Tahun', subCategory: '2010S' },
+      { spotifyId: 'tr_2010_4', title: 'Someone Like You', artist: 'Adele', album: '21', category: 'Era & Tahun', subCategory: '2010S' },
+      { spotifyId: 'tr_2010_5', title: 'Counting Stars', artist: 'OneRepublic', album: 'Native', category: 'Era & Tahun', subCategory: '2010S' },
+      { spotifyId: 'tr_2010_6', title: 'Wake Me Up', artist: 'Avicii', album: 'True', category: 'Era & Tahun', subCategory: '2010S' },
+      { spotifyId: 'tr_2010_7', title: 'Closer', artist: 'The Chainsmokers, Halsey', album: 'Collage', category: 'Era & Tahun', subCategory: '2010S' },
+      { spotifyId: 'tr_2010_8', title: 'Monokrom', artist: 'Tulus', album: 'Monokrom', category: 'Era & Tahun', subCategory: '2010S' },
+      { spotifyId: 'tr_2010_9', title: 'Akad', artist: 'Payung Teduh', album: 'Ruang Tunggu', category: 'Era & Tahun', subCategory: '2010S' },
+      { spotifyId: 'tr_2010_10', title: 'See You Again', artist: 'Wiz Khalifa, Charlie Puth', album: 'Furious 7', category: 'Era & Tahun', subCategory: '2010S' },
+
+      // ==========================================
+      // ERA & TAHUN: 2000S
+      // ==========================================
+      { spotifyId: 'tr_2000_1', title: 'Yellow', artist: 'Coldplay', album: 'Parachutes', category: 'Era & Tahun', subCategory: '2000S' },
+      { spotifyId: 'tr_2000_2', title: 'Fix You', artist: 'Coldplay', album: 'X&Y', category: 'Era & Tahun', subCategory: '2000S' },
+      { spotifyId: 'tr_2000_3', title: 'Mr. Brightside', artist: 'The Killers', album: 'Hot Fuss', category: 'Era & Tahun', subCategory: '2000S' },
+      { spotifyId: 'tr_2000_4', title: 'Umbrella', artist: 'Rihanna, JAY-Z', album: 'Good Girl Gone Bad', category: 'Era & Tahun', subCategory: '2000S' },
+      { spotifyId: 'tr_2000_5', title: 'In the End', artist: 'Linkin Park', album: 'Hybrid Theory', category: 'Era & Tahun', subCategory: '2000S' },
+      { spotifyId: 'tr_2000_6', title: 'Numb', artist: 'Linkin Park', album: 'Meteora', category: 'Era & Tahun', subCategory: '2000S' },
+      { spotifyId: 'tr_2000_7', title: 'Dan', artist: 'Sheila On 7', album: 'Sheila On 7', category: 'Era & Tahun', subCategory: '2000S' },
+      { spotifyId: 'tr_2000_8', title: 'Sephia', artist: 'Sheila On 7', album: 'Kisah Klasik Untuk Masa Depan', category: 'Era & Tahun', subCategory: '2000S' },
+      { spotifyId: 'tr_2000_9', title: 'Pupus', artist: 'Dewa 19', album: 'Cintailah Cinta', category: 'Era & Tahun', subCategory: '2000S' },
+      { spotifyId: 'tr_2000_10', title: 'Mungkin Nanti', artist: 'Peterpan', album: 'Bintang di Surga', category: 'Era & Tahun', subCategory: '2000S' },
+
+      // ==========================================
+      // ERA & TAHUN: 1990S
+      // ==========================================
+      { spotifyId: 'tr_1990_1', title: 'Smells Like Teen Spirit', artist: 'Nirvana', album: 'Nevermind', category: 'Era & Tahun', subCategory: '1990S' },
+      { spotifyId: 'tr_1990_2', title: 'Wonderwall', artist: 'Oasis', album: '(What\'s the Story) Morning Glory?', category: 'Era & Tahun', subCategory: '1990S' },
+      { spotifyId: 'tr_1990_3', title: 'Creep', artist: 'Radiohead', album: 'Pablo Honey', category: 'Era & Tahun', subCategory: '1990S' },
+      { spotifyId: 'tr_1990_4', title: 'I Want It That Way', artist: 'Backstreet Boys', album: 'Millennium', category: 'Era & Tahun', subCategory: '1990S' },
+      { spotifyId: 'tr_1990_5', title: 'Kangen', artist: 'Dewa 19', album: 'Dewa 19', category: 'Era & Tahun', subCategory: '1990S' },
+      { spotifyId: 'tr_1990_6', title: 'Kala Cinta Menggoda', artist: 'Chrisye', album: 'Kala Cinta Menggoda', category: 'Era & Tahun', subCategory: '1990S' },
+
+      // ==========================================
+      // ERA & TAHUN: 1980S (Paling lama 1980)
+      // ==========================================
+      { spotifyId: 'tr_1980_1', title: 'Billie Jean', artist: 'Michael Jackson', album: 'Thriller', category: 'Era & Tahun', subCategory: '1980S' },
+      { spotifyId: 'tr_1980_2', title: 'Take On Me', artist: 'a-ha', album: 'Hunting High and Low', category: 'Era & Tahun', subCategory: '1980S' },
+      { spotifyId: 'tr_1980_3', title: 'Sweet Child O\' Mine', artist: 'Guns N\' Roses', album: 'Appetite for Destruction', category: 'Era & Tahun', subCategory: '1980S' },
+      { spotifyId: 'tr_1980_4', title: 'Livin\' On A Prayer', artist: 'Bon Jovi', album: 'Slippery When Wet', category: 'Era & Tahun', subCategory: '1980S' },
+      { spotifyId: 'tr_1980_5', title: 'Careless Whisper', artist: 'George Michael', album: 'Make It Big', category: 'Era & Tahun', subCategory: '1980S' },
+      { spotifyId: 'tr_1980_6', title: 'Never Gonna Give You Up', artist: 'Rick Astley', album: 'Whenever You Need Somebody', category: 'Era & Tahun', subCategory: '1980S' }
     ];
   }
 }

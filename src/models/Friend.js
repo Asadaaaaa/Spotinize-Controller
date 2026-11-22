@@ -22,7 +22,7 @@ Friend.init(
     },
     status: {
       type: DataTypes.STRING,
-      defaultValue: 'ACCEPTED'
+      defaultValue: 'PENDING'
     }
   },
   {

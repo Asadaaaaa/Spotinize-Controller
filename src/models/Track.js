@@ -42,6 +42,18 @@ Track.init({
     type: DataTypes.STRING,
     allowNull: true
   },
+  genre: {
+    type: DataTypes.STRING,
+    allowNull: true
+  },
+  releaseYear: {
+    type: DataTypes.INTEGER,
+    allowNull: true
+  },
+  yearlyHitId: {
+    type: DataTypes.UUID,
+    allowNull: true
+  },
   durationMs: {
     type: DataTypes.INTEGER,
     defaultValue: 30000

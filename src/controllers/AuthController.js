@@ -1,9 +1,10 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { spotifyService } from '../services/SpotifyService.js';
+import { imageCacheService } from '../services/ImageCacheService.js';
 import { userRepository } from '../repositories/UserRepository.js';
-
-const JWT_SECRET = process.env.JWT_SECRET || 'spotinize_super_secret_jwt_key_2026';
+import { historyRepository } from '../repositories/HistoryRepository.js';
+import { JWT_SECRET, extractBearerToken } from '../middleware/authMiddleware.js';
 
 export class AuthController {
   /**
@@ -91,6 +92,7 @@ export class AuthController {
       }
 
       const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
+      const summary = await historyRepository.getSummary(user.id);
 
       return res.json({
         user: {
@@ -102,7 +104,10 @@ export class AuthController {
           gamesPlayed: user.gamesPlayed || 0,
           bestScore: user.bestScore || 0,
           totalScore: user.totalScore || 0,
-          winRate: user.winRate || 0
+          winRate: summary.guessRate,
+          guessRate: summary.guessRate,
+          totalSongsGuessed: summary.totalSongsGuessed,
+          totalSongsPlayed: summary.totalSongsPlayed
         },
         token,
         requireSpotifyConnect: false
@@ -169,7 +174,8 @@ export class AuthController {
           gamesPlayed: user.gamesPlayed || 0,
           bestScore: user.bestScore || 0,
           totalScore: user.totalScore || 0,
-          winRate: user.winRate || 0
+          winRate: user.winRate || 0,
+          guessRate: user.winRate || 0
         },
         token,
         requireSpotifyConnect: false,
@@ -183,45 +189,65 @@ export class AuthController {
   }
 
   /**
-   * Get Current Authenticated User profile
+   * Get Current Authenticated User profile (strictly requires valid JWT + existing user)
    */
   async getMe(req, res) {
     try {
-      let userId = req.headers['x-user-id'] || req.query.userId;
-      if (!userId && req.headers['authorization']) {
-        const authHeader = req.headers['authorization'];
-        if (authHeader.startsWith('Bearer ')) {
-          try {
-            const tokenStr = authHeader.substring(7);
-            const decoded = jwt.verify(tokenStr, JWT_SECRET);
-            userId = decoded.id;
-          } catch (e) {}
+      const tokenStr = extractBearerToken(req.headers.authorization);
+      if (!tokenStr) {
+        return res.status(401).json({ error: 'Token tidak ditemukan', code: 'TOKEN_MISSING' });
+      }
+
+      let decoded;
+      try {
+        decoded = jwt.verify(tokenStr, JWT_SECRET);
+      } catch (err) {
+        if (err?.name === 'TokenExpiredError') {
+          return res.status(401).json({ error: 'Token sudah kadaluarsa', code: 'TOKEN_EXPIRED' });
         }
+        return res.status(401).json({ error: 'Token tidak valid', code: 'TOKEN_INVALID' });
       }
 
-      if (!userId) {
-        return res.status(401).json({ error: 'User ID is required' });
+      if (!decoded?.id) {
+        return res.status(401).json({ error: 'Token tidak valid', code: 'TOKEN_INVALID' });
       }
 
-      const user = await userRepository.findById(userId);
+      const user = await userRepository.findById(decoded.id);
       if (!user) {
-        return res.status(404).json({ error: 'User not found' });
+        return res.status(404).json({ error: 'User tidak ditemukan', code: 'USER_NOT_FOUND' });
       }
 
-      return res.json({
-        user: {
-          id: user.id,
-          username: user.username,
-          displayName: user.displayName,
-          avatarUrl: user.avatarUrl,
-          spotifyConnected: !!user.spotifyConnected,
-          gamesPlayed: user.gamesPlayed || 0,
-          bestScore: user.bestScore || 0,
-          totalScore: user.totalScore || 0,
-          winRate: user.winRate || 0,
-          favoriteCategory: user.favoriteCategory
+      if (user.favoriteSongTitle && !imageCacheService.isLocalCachedImage(user.favoriteSongCover)) {
+        const cachedCover = await imageCacheService.resolveTrackArtwork(
+          {
+            spotifyId: user.favoriteSongSpotifyId,
+            title: user.favoriteSongTitle,
+            artist: user.favoriteSongArtist,
+            albumArt: user.favoriteSongCover
+          },
+          {
+            allowRemoteFallback: true,
+            searchFn: (q) => spotifyService.searchTracks(q, null, 5)
+          }
+        );
+        if (cachedCover && cachedCover !== user.favoriteSongCover) {
+          await userRepository.update(user.id, { favoriteSongCover: cachedCover }).catch(() => {});
+          user.favoriteSongCover = cachedCover;
         }
-      });
+      }
+
+      const summary = await historyRepository.getSummary(user.id);
+      const cleanUser = user.toJSON ? user.toJSON() : { ...user };
+      delete cleanUser.password;
+      delete cleanUser.accessToken;
+      delete cleanUser.refreshToken;
+      cleanUser.spotifyConnected = !!cleanUser.spotifyConnected;
+      cleanUser.guessRate = summary.guessRate;
+      cleanUser.winRate = summary.guessRate;
+      cleanUser.totalSongsGuessed = summary.totalSongsGuessed;
+      cleanUser.totalSongsPlayed = summary.totalSongsPlayed;
+
+      return res.json({ user: cleanUser });
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }

@@ -1,5 +1,6 @@
 import { User } from '../models/index.js';
 import { Op } from 'sequelize';
+import { historyRepository } from './HistoryRepository.js';
 
 export class UserRepository {
   async findById(id) {
@@ -52,7 +53,7 @@ export class UserRepository {
     return await user.update(updatePayload);
   }
 
-  async updateStats(id, { score = 0, isWin = false, thinkingTime = 0, songsGuessed = 0, category = null }) {
+  async updateStats(id, { score = 0, isWin = false, thinkingTime = 0, songsGuessed = 0, totalSongsPlayed = 0, category = null }) {
     const user = await this.findById(id);
     if (!user) return null;
 
@@ -60,17 +61,26 @@ export class UserRepository {
     const newTotalScore = (user.totalScore || 0) + score;
     const newBestScore = Math.max(user.bestScore || 0, score);
     const newAverageScore = Math.round(newTotalScore / newGamesPlayed);
-    const currentWins = Math.round(((user.winRate || 0) / 100) * (user.gamesPlayed || 0)) + (isWin ? 1 : 0);
-    const newWinRate = Math.round((currentWins / newGamesPlayed) * 100);
-    const newTotalSongs = (user.totalSongsGuessed || 0) + songsGuessed;
+
+    // Compute cumulative correct-guess rate across all played songs from GameHistory
+    const summary = await historyRepository.getSummary(id);
+    let computedGuessed = summary.totalSongsGuessed;
+    let computedRate = summary.guessRate;
+
+    if (summary.totalGames === 0) {
+      computedGuessed = (user.totalSongsGuessed || 0) + songsGuessed;
+      computedRate = totalSongsPlayed > 0
+        ? Math.min(100, Math.round((computedGuessed / totalSongsPlayed) * 100))
+        : 0;
+    }
 
     const updatePayload = {
       gamesPlayed: newGamesPlayed,
       totalScore: newTotalScore,
       bestScore: newBestScore,
       averageScore: newAverageScore,
-      winRate: newWinRate,
-      totalSongsGuessed: newTotalSongs
+      winRate: computedRate,
+      totalSongsGuessed: computedGuessed
     };
 
     if (category) {
@@ -81,7 +91,7 @@ export class UserRepository {
   }
 
   async getLeaderboard(limit = 20) {
-    return await User.findAll({
+    const rows = await User.findAll({
       where: {
         gamesPlayed: {
           [Op.gt]: 0
@@ -94,7 +104,17 @@ export class UserRepository {
         ['gamesPlayed', 'DESC']
       ],
       limit,
-      attributes: ['id', 'username', 'displayName', 'avatarUrl', 'bestScore', 'totalScore', 'gamesPlayed', 'winRate']
+      attributes: ['id', 'username', 'displayName', 'avatarUrl', 'bestScore', 'totalScore', 'gamesPlayed', 'winRate', 'totalSongsGuessed']
+    });
+
+    return rows.map(u => {
+      const plain = u.toJSON ? u.toJSON() : { ...u };
+      const rate = Math.round(plain.winRate || 0);
+      return {
+        ...plain,
+        winRate: rate,
+        guessRate: rate
+      };
     });
   }
 }

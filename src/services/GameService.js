@@ -456,6 +456,7 @@ export class GameService {
       isWin: true,
       thinkingTime: player.totalThinkingTime,
       songsGuessed: correctCount,
+      totalSongsPlayed: game.numberOfSongs,
       category: game.category
     });
 
@@ -536,11 +537,13 @@ export class GameService {
       });
 
       // Update User Stats
+      const recordedInGame = correctCount + wrongCount + skippedCount;
       await userRepository.updateStats(p.userId, {
         score: p.score,
         isWin: isWinner,
         thinkingTime: p.totalThinkingTime,
         songsGuessed: correctCount,
+        totalSongsPlayed: p.status === 'LEFT' ? recordedInGame : game.numberOfSongs,
         category: game.category
       });
     }

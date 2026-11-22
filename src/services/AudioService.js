@@ -17,6 +17,8 @@ export class AudioService {
     if (!fs.existsSync(this.cacheDir)) {
       fs.mkdirSync(this.cacheDir, { recursive: true });
     }
+    this.inFlightResolves = new Map();
+    this.inFlightClips = new Map();
   }
 
   _sanitizeFilename(str) {
@@ -40,9 +42,14 @@ export class AudioService {
   }
 
   /**
-   * Downloads audio from a direct URL (e.g. iTunes/Spotify preview URL)
+   * Downloads audio from a direct URL atomically via temp files and normalizes to MP3.
    */
   async _downloadFromUrl(url, destPath) {
+    const uniq = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const baseNoExt = destPath.replace(/\.mp3$/, '');
+    const downloadTmp = `${baseNoExt}.dl_${uniq}.tmp`;
+    const mp3Tmp = `${baseNoExt}.conv_${uniq}.tmp.mp3`;
+
     try {
       const response = await axios({
         url,
@@ -54,7 +61,7 @@ export class AudioService {
         }
       });
 
-      const writer = fs.createWriteStream(destPath);
+      const writer = fs.createWriteStream(downloadTmp);
       response.data.pipe(writer);
 
       await new Promise((resolve, reject) => {
@@ -62,25 +69,31 @@ export class AudioService {
         writer.on('error', reject);
       });
 
-      // Convert m4a to mp3 if necessary (iTunes previews are m4a)
-      if (fs.existsSync(destPath) && fs.statSync(destPath).size > 1000) {
-        // Check if the file is actually m4a by reading header
-        const mp3Path = destPath;
-        const tempPath = destPath + '.temp';
+      if (fs.existsSync(downloadTmp) && fs.statSync(downloadTmp).size > 1000) {
         try {
-          await execPromise(`ffmpeg -y -i "${destPath}" -ar 44100 -ac 2 -b:a 192k "${tempPath}" 2>/dev/null`);
-          if (fs.existsSync(tempPath) && fs.statSync(tempPath).size > 1000) {
-            fs.renameSync(tempPath, mp3Path);
-            return mp3Path;
+          await execPromise(`ffmpeg -y -i "${downloadTmp}" -ar 44100 -ac 2 -b:a 192k -f mp3 "${mp3Tmp}" 2>/dev/null`);
+          if (fs.existsSync(mp3Tmp) && fs.statSync(mp3Tmp).size > 1000) {
+            fs.renameSync(mp3Tmp, destPath);
+            return destPath;
           }
         } catch (e) {
-          // If ffmpeg conversion fails, the file might already be mp3
-          if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+          // If ffmpeg conversion fails, fall back only if downloaded file itself is valid audio
         }
-        return destPath;
+
+        if (fs.existsSync(downloadTmp) && fs.statSync(downloadTmp).size > 5000) {
+          fs.renameSync(downloadTmp, destPath);
+          return destPath;
+        }
       }
     } catch (err) {
       console.warn(`[AudioService] Direct download failed for ${url}:`, err.message);
+    } finally {
+      if (fs.existsSync(downloadTmp)) {
+        try { fs.unlinkSync(downloadTmp); } catch (e) {}
+      }
+      if (fs.existsSync(mp3Tmp)) {
+        try { fs.unlinkSync(mp3Tmp); } catch (e) {}
+      }
     }
     return null;
   }
@@ -223,106 +236,143 @@ export class AudioService {
   }
 
   /**
-   * Resolves and downloads the full track audio using multiple strategies:
-   * 1. Existing cache
-   * 2. Track's own previewUrl (Spotify/iTunes)
-   * 3. iTunes Search API for preview URL
-   * 4. SoundCloud via yt-dlp (fallback)
-   * 5. YouTube via yt-dlp (last resort)
+   * Resolves and downloads the full track audio with in-flight promise deduplication.
    */
   async resolveAudio(trackId, title, artist, previewUrl = null) {
     const sourcePath = this.getSourceAudioPath(trackId, title, artist);
 
-    // 1. Return from local cache if already present and valid
     if (fs.existsSync(sourcePath) && fs.statSync(sourcePath).size > 5000) {
       return sourcePath;
     }
 
-    console.log(`🎵 [AudioService] Resolving audio for: ${artist} - ${title}...`);
-
-    // 2. Try direct download from existing previewUrl (Spotify or iTunes)
-    if (previewUrl) {
-      console.log(`   [Strategy 1] Downloading from track previewUrl...`);
-      const result = await this._downloadFromUrl(previewUrl, sourcePath);
-      if (result && fs.existsSync(sourcePath) && fs.statSync(sourcePath).size > 5000) {
-        console.log(`✅ [AudioService] Downloaded from previewUrl for: ${artist} - ${title}`);
-        return sourcePath;
-      }
+    if (this.inFlightResolves.has(sourcePath)) {
+      return await this.inFlightResolves.get(sourcePath);
     }
 
-    // 3. Search iTunes for preview URL and download
-    console.log(`   [Strategy 2] Searching iTunes for preview URL...`);
-    const itunesUrl = await this._findItunesPreviewUrl(title, artist);
-    if (itunesUrl) {
-      const result = await this._downloadFromUrl(itunesUrl, sourcePath);
-      if (result && fs.existsSync(sourcePath) && fs.statSync(sourcePath).size > 5000) {
-        console.log(`✅ [AudioService] Downloaded from iTunes preview for: ${artist} - ${title}`);
-        return sourcePath;
-      }
-    }
+    const resolvePromise = (async () => {
+      console.log(`🎵 [AudioService] Resolving audio for: ${artist} - ${title}...`);
 
-    // 4. SoundCloud via yt-dlp (may be blocked)
-    console.log(`   [Strategy 3] Trying SoundCloud via yt-dlp...`);
-    const basePath = sourcePath.replace(/\.mp3$/, '');
-    const safeArtistQuery = this._escapeShellArg(artist);
-    const safeTitleQuery = this._escapeShellArg(title);
-    const scQueries = [
-      `scsearch1:${safeArtistQuery} ${safeTitleQuery}`,
-      `scsearch1:${safeTitleQuery} ${safeArtistQuery}`
-    ];
-
-    for (const scQuery of scQueries) {
-      try {
-        const ytdlpCmd = `yt-dlp --no-playlist --extract-audio --audio-format mp3 --audio-quality 5 -o "${basePath}.%(ext)s" "${scQuery}"`;
-        await Promise.race([
-          execPromise(ytdlpCmd),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('yt-dlp timeout')), 12000))
-        ]);
-
-        if (fs.existsSync(sourcePath) && fs.statSync(sourcePath).size > 5000) {
-          console.log(`✅ [AudioService] Downloaded from SoundCloud for: ${artist} - ${title}`);
+      // 2. Try direct download from existing previewUrl (Spotify or iTunes)
+      if (previewUrl) {
+        console.log(`   [Strategy 1] Downloading from track previewUrl...`);
+        const result = await this._downloadFromUrl(previewUrl, sourcePath);
+        if (result && fs.existsSync(sourcePath) && fs.statSync(sourcePath).size > 5000) {
+          console.log(`✅ [AudioService] Downloaded from previewUrl for: ${artist} - ${title}`);
           return sourcePath;
         }
-      } catch (err) {
-        // SoundCloud blocked — continue to next strategy
       }
-    }
 
-    // 5. YouTube via yt-dlp (last resort, may need cookies)
-    console.log(`   [Strategy 4] Trying YouTube via yt-dlp...`);
-    const ytQueries = [
-      `ytsearch1:${safeArtistQuery} ${safeTitleQuery} official audio`,
-      `ytsearch1:${safeArtistQuery} ${safeTitleQuery}`
-    ];
-
-    for (const ytQuery of ytQueries) {
-      try {
-        const ytCmd = `yt-dlp --no-playlist --extract-audio --audio-format mp3 --audio-quality 5 -o "${basePath}.%(ext)s" "${ytQuery}"`;
-        await Promise.race([
-          execPromise(ytCmd),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('yt-dlp yt timeout')), 15000))
-        ]);
-
-        if (fs.existsSync(sourcePath) && fs.statSync(sourcePath).size > 5000) {
-          console.log(`✅ [AudioService] Downloaded from YouTube for: ${artist} - ${title}`);
+      // 3. Search iTunes for preview URL and download
+      console.log(`   [Strategy 2] Searching iTunes for preview URL...`);
+      const itunesUrl = await this._findItunesPreviewUrl(title, artist);
+      if (itunesUrl) {
+        const result = await this._downloadFromUrl(itunesUrl, sourcePath);
+        if (result && fs.existsSync(sourcePath) && fs.statSync(sourcePath).size > 5000) {
+          console.log(`✅ [AudioService] Downloaded from iTunes preview for: ${artist} - ${title}`);
           return sourcePath;
         }
-      } catch (err) {
-        // YouTube also failed — continue
       }
-    }
 
-    // All strategies failed
-    if (fs.existsSync(sourcePath) && fs.statSync(sourcePath).size > 5000) {
-      return sourcePath;
-    }
+      // 4. SoundCloud via yt-dlp (atomic temp output)
+      console.log(`   [Strategy 3] Trying SoundCloud via yt-dlp...`);
+      const basePath = sourcePath.replace(/\.mp3$/, '');
+      const safeArtistQuery = this._escapeShellArg(artist);
+      const safeTitleQuery = this._escapeShellArg(title);
+      const scQueries = [
+        `scsearch1:${safeArtistQuery} ${safeTitleQuery}`,
+        `scsearch1:${safeTitleQuery} ${safeArtistQuery}`
+      ];
 
-    throw new Error(`Tidak dapat mengunduh audio untuk ${artist} - ${title}`);
+      for (const scQuery of scQueries) {
+        const tmpBase = `${basePath}.sc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const tmpMp3 = `${tmpBase}.mp3`;
+        try {
+          const ytdlpCmd = `yt-dlp --no-playlist --extract-audio --audio-format mp3 --audio-quality 5 -o "${tmpBase}.%(ext)s" "${scQuery}"`;
+          await Promise.race([
+            execPromise(ytdlpCmd),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('yt-dlp timeout')), 12000))
+          ]);
+
+          if (fs.existsSync(tmpMp3) && fs.statSync(tmpMp3).size > 5000) {
+            fs.renameSync(tmpMp3, sourcePath);
+            console.log(`✅ [AudioService] Downloaded from SoundCloud for: ${artist} - ${title}`);
+            return sourcePath;
+          }
+        } catch (err) {
+          // SoundCloud blocked — continue to next strategy
+        } finally {
+          if (fs.existsSync(tmpMp3)) {
+            try { fs.unlinkSync(tmpMp3); } catch (e) {}
+          }
+        }
+      }
+
+      // 5. YouTube via yt-dlp (atomic temp output)
+      console.log(`   [Strategy 4] Trying YouTube via yt-dlp...`);
+      const ytQueries = [
+        `ytsearch1:${safeArtistQuery} ${safeTitleQuery} official audio`,
+        `ytsearch1:${safeArtistQuery} ${safeTitleQuery}`
+      ];
+
+      for (const ytQuery of ytQueries) {
+        const tmpBase = `${basePath}.yt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const tmpMp3 = `${tmpBase}.mp3`;
+        try {
+          const ytCmd = `yt-dlp --no-playlist --extract-audio --audio-format mp3 --audio-quality 5 -o "${tmpBase}.%(ext)s" "${ytQuery}"`;
+          await Promise.race([
+            execPromise(ytCmd),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('yt-dlp yt timeout')), 15000))
+          ]);
+
+          if (fs.existsSync(tmpMp3) && fs.statSync(tmpMp3).size > 5000) {
+            fs.renameSync(tmpMp3, sourcePath);
+            console.log(`✅ [AudioService] Downloaded from YouTube for: ${artist} - ${title}`);
+            return sourcePath;
+          }
+        } catch (err) {
+          // YouTube also failed — continue
+        } finally {
+          if (fs.existsSync(tmpMp3)) {
+            try { fs.unlinkSync(tmpMp3); } catch (e) {}
+          }
+        }
+      }
+
+      if (fs.existsSync(sourcePath) && fs.statSync(sourcePath).size > 5000) {
+        return sourcePath;
+      }
+
+      throw new Error(`Tidak dapat mengunduh audio untuk ${artist} - ${title}`);
+    })();
+
+    this.inFlightResolves.set(sourcePath, resolvePromise);
+    try {
+      return await resolvePromise;
+    } finally {
+      this.inFlightResolves.delete(sourcePath);
+    }
   }
 
   /**
-   * Produces or returns the clipped audio file starting STRICTLY from 00:00:00.000
-   * for the exact reveal duration (0.1s, 0.5s, 1s, 2s, 3s, 4s, 5s)
+   * Checks whether an audio clip has valid size and audible (non-silent) waveform energy.
+   */
+  async _hasAudibleEnergy(filePath) {
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).size <= 500) {
+      return false;
+    }
+    try {
+      const { stderr } = await execPromise(`ffmpeg -i "${filePath}" -af volumedetect -f null /dev/null 2>&1`);
+      const match = stderr.match(/max_volume:\s*([-\d.]+)\s*dB/);
+      if (match) {
+        const maxDb = parseFloat(match[1]);
+        return Number.isFinite(maxDb) && maxDb > -50;
+      }
+    } catch (e) {}
+    return true;
+  }
+
+  /**
+   * Produces or returns the clipped audio file atomically with concurrency lock and non-silence guard.
    */
   async getClueAudio(trackId, title, artist, durationSeconds, previewUrl = null) {
     const clippedPath = this.getClippedAudioPath(trackId, title, artist, durationSeconds);
@@ -331,25 +381,58 @@ export class AudioService {
       return clippedPath;
     }
 
-    const sourcePath = await this.resolveAudio(trackId, title, artist, previewUrl);
-    if (!sourcePath || !fs.existsSync(sourcePath)) {
-      throw new Error(`Audio source tidak ditemukan untuk ${artist} - ${title}`);
+    if (this.inFlightClips.has(clippedPath)) {
+      return await this.inFlightClips.get(clippedPath);
     }
 
-    // Clip starting from the exact first moment sound begins (silence removed) to durationSeconds with smooth micro-fadeout
-    try {
-      const fadeStart = Math.max(0, durationSeconds - 0.02);
-      const clipCmd = `ffmpeg -y -i "${sourcePath}" -af "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-40dB,atrim=0:${durationSeconds},afade=t=out:st=${fadeStart}:d=0.02" -ar 44100 -ac 2 -b:a 192k "${clippedPath}"`;
-      await execPromise(clipCmd);
-
-      if (fs.existsSync(clippedPath) && fs.statSync(clippedPath).size > 200) {
+    const clipPromise = (async () => {
+      // Re-check inside lock
+      if (fs.existsSync(clippedPath) && fs.statSync(clippedPath).size > 500) {
         return clippedPath;
       }
-    } catch (err) {
-      console.error(`[AudioService] Error clipping audio with silence removal for ${durationSeconds}s:`, err.message);
-    }
 
-    return sourcePath;
+      const sourcePath = await this.resolveAudio(trackId, title, artist, previewUrl);
+      if (!sourcePath || !fs.existsSync(sourcePath)) {
+        throw new Error(`Audio source tidak ditemukan untuk ${artist} - ${title}`);
+      }
+
+      const uniq = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const tempClipPath = `${clippedPath.replace(/\.mp3$/, '')}.tmp_${uniq}.mp3`;
+      const fadeDur = durationSeconds <= 0.15 ? 0.015 : 0.02;
+      const fadeStart = Math.max(0, durationSeconds - fadeDur);
+
+      try {
+        const primaryFilter = `silenceremove=start_periods=1:start_duration=0.01:start_threshold=-32dB,atrim=0:${durationSeconds},afade=t=out:st=${fadeStart}:d=${fadeDur}`;
+        await execPromise(`ffmpeg -y -i "${sourcePath}" -af "${primaryFilter}" -ar 44100 -ac 2 -b:a 192k -f mp3 "${tempClipPath}"`);
+
+        const primaryOk = await this._hasAudibleEnergy(tempClipPath);
+        if (!primaryOk) {
+          // Fallback to plain atrim without silenceremove so the clip is guaranteed non-empty
+          const fallbackFilter = `atrim=0:${durationSeconds},afade=t=out:st=${fadeStart}:d=${fadeDur}`;
+          await execPromise(`ffmpeg -y -i "${sourcePath}" -af "${fallbackFilter}" -ar 44100 -ac 2 -b:a 192k -f mp3 "${tempClipPath}"`);
+        }
+
+        if (fs.existsSync(tempClipPath) && fs.statSync(tempClipPath).size > 500) {
+          fs.renameSync(tempClipPath, clippedPath);
+          return clippedPath;
+        }
+      } catch (err) {
+        console.error(`[AudioService] Error clipping audio for ${durationSeconds}s:`, err.message);
+      } finally {
+        if (fs.existsSync(tempClipPath)) {
+          try { fs.unlinkSync(tempClipPath); } catch (e) {}
+        }
+      }
+
+      return sourcePath;
+    })();
+
+    this.inFlightClips.set(clippedPath, clipPromise);
+    try {
+      return await clipPromise;
+    } finally {
+      this.inFlightClips.delete(clippedPath);
+    }
   }
 
   /**

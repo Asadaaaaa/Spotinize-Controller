@@ -1,6 +1,8 @@
 import { userRepository } from '../repositories/UserRepository.js';
 import { historyRepository } from '../repositories/HistoryRepository.js';
+import { trackRepository } from '../repositories/TrackRepository.js';
 import { spotifyService } from '../services/SpotifyService.js';
+import { imageCacheService } from '../services/ImageCacheService.js';
 
 function formatSpotifyUrl(url, spotifyId) {
   if (url && url.trim()) {
@@ -19,6 +21,32 @@ function formatSpotifyUrl(url, spotifyId) {
   return null;
 }
 
+async function ensureFavoriteSongCoverCached(user) {
+  if (!user?.favoriteSongTitle) return user?.favoriteSongCover || null;
+  if (imageCacheService.isLocalCachedImage(user.favoriteSongCover)) {
+    return user.favoriteSongCover;
+  }
+
+  const resolved = await imageCacheService.resolveTrackArtwork(
+    {
+      spotifyId: user.favoriteSongSpotifyId,
+      title: user.favoriteSongTitle,
+      artist: user.favoriteSongArtist,
+      albumArt: user.favoriteSongCover
+    },
+    {
+      allowRemoteFallback: true,
+      searchFn: (q) => spotifyService.searchTracks(q, null, 5)
+    }
+  );
+
+  if (resolved && resolved !== user.favoriteSongCover) {
+    await userRepository.update(user.id, { favoriteSongCover: resolved }).catch(() => {});
+  }
+
+  return resolved || user.favoriteSongCover || null;
+}
+
 export class ProfileController {
   async getProfile(req, res) {
     try {
@@ -26,13 +54,21 @@ export class ProfileController {
       const user = await userRepository.findById(id);
       if (!user) return res.status(404).json({ error: 'User tidak ditemukan' });
 
+      const cachedCover = await ensureFavoriteSongCoverCached(user);
+
       const cleanUser = user.toJSON ? user.toJSON() : { ...user };
+      cleanUser.favoriteSongCover = cachedCover;
       cleanUser.spotifyUrl = formatSpotifyUrl(cleanUser.spotifyUrl, cleanUser.spotifyId);
       delete cleanUser.password;
       delete cleanUser.accessToken;
       delete cleanUser.refreshToken;
 
       const summary = await historyRepository.getSummary(id);
+      cleanUser.guessRate = summary.guessRate;
+      cleanUser.winRate = summary.guessRate;
+      cleanUser.totalSongsGuessed = summary.totalSongsGuessed;
+      cleanUser.totalSongsPlayed = summary.totalSongsPlayed;
+
       return res.json({
         user: cleanUser,
         summary
@@ -50,7 +86,10 @@ export class ProfileController {
       const user = await userRepository.findByUsername(username.toLowerCase().trim());
       if (!user) return res.status(404).json({ error: 'Pemain dengan username tersebut tidak ditemukan' });
 
+      const cachedCover = await ensureFavoriteSongCoverCached(user);
+
       const cleanUser = user.toJSON ? user.toJSON() : { ...user };
+      cleanUser.favoriteSongCover = cachedCover;
       cleanUser.spotifyUrl = formatSpotifyUrl(cleanUser.spotifyUrl, cleanUser.spotifyId);
       delete cleanUser.password;
       delete cleanUser.accessToken;
@@ -58,6 +97,10 @@ export class ProfileController {
 
       const summary = await historyRepository.getSummary(user.id);
       const histories = await historyRepository.getByUser(user.id, 5);
+      cleanUser.guessRate = summary.guessRate;
+      cleanUser.winRate = summary.guessRate;
+      cleanUser.totalSongsGuessed = summary.totalSongsGuessed;
+      cleanUser.totalSongsPlayed = summary.totalSongsPlayed;
 
       return res.json({
         user: cleanUser,
@@ -117,7 +160,7 @@ export class ProfileController {
         updatePayload.spotifyUrl = formatSpotifyUrl(spotifyUrl, null);
       }
 
-      // Handle favorite song
+      // Handle favorite song (supports albumArt, coverUrl, and cover + caches locally on server)
       if (favoriteSong !== undefined) {
         if (favoriteSong === null) {
           updatePayload.favoriteSongTitle = null;
@@ -126,18 +169,66 @@ export class ProfileController {
           updatePayload.favoriteSongSpotifyId = null;
           updatePayload.favoriteSongPreviewUrl = null;
         } else {
-          updatePayload.favoriteSongTitle = favoriteSong.title || null;
-          updatePayload.favoriteSongArtist = favoriteSong.artist || null;
-          updatePayload.favoriteSongCover = favoriteSong.coverUrl || favoriteSong.cover || null;
-          updatePayload.favoriteSongSpotifyId = favoriteSong.spotifyId || favoriteSong.id || null;
+          const title = favoriteSong.title || null;
+          const artist = favoriteSong.artist || null;
+          const spotifyId = favoriteSong.spotifyId || favoriteSong.id || null;
+          const rawCover = favoriteSong.albumArt || favoriteSong.coverUrl || favoriteSong.cover || null;
+
+          const cachedCover = title
+            ? await imageCacheService.resolveTrackArtwork(
+                { spotifyId, title, artist, albumArt: rawCover },
+                {
+                  allowRemoteFallback: true,
+                  searchFn: (q) => spotifyService.searchTracks(q, null, 5)
+                }
+              )
+            : rawCover;
+
+          updatePayload.favoriteSongTitle = title;
+          updatePayload.favoriteSongArtist = artist;
+          updatePayload.favoriteSongCover = cachedCover || rawCover || null;
+          updatePayload.favoriteSongSpotifyId = spotifyId;
           updatePayload.favoriteSongPreviewUrl = favoriteSong.previewUrl || null;
         }
       } else {
         if (favoriteSongTitle !== undefined) updatePayload.favoriteSongTitle = favoriteSongTitle;
         if (favoriteSongArtist !== undefined) updatePayload.favoriteSongArtist = favoriteSongArtist;
-        if (favoriteSongCover !== undefined) updatePayload.favoriteSongCover = favoriteSongCover;
+        if (favoriteSongCover !== undefined) {
+          updatePayload.favoriteSongCover = favoriteSongCover
+            ? await imageCacheService.resolveTrackArtwork(
+                {
+                  spotifyId: favoriteSongSpotifyId,
+                  title: favoriteSongTitle,
+                  artist: favoriteSongArtist,
+                  albumArt: favoriteSongCover
+                },
+                {
+                  allowRemoteFallback: true,
+                  searchFn: (q) => spotifyService.searchTracks(q, null, 5)
+                }
+              )
+            : null;
+        }
         if (favoriteSongSpotifyId !== undefined) updatePayload.favoriteSongSpotifyId = favoriteSongSpotifyId;
         if (favoriteSongPreviewUrl !== undefined) updatePayload.favoriteSongPreviewUrl = favoriteSongPreviewUrl;
+      }
+
+      // Sync cached artwork into tracks table so tebak lagu reuses the same local image
+      if (updatePayload.favoriteSongSpotifyId && updatePayload.favoriteSongCover) {
+        const existingTrack = await trackRepository.findBySpotifyId(updatePayload.favoriteSongSpotifyId);
+        if (existingTrack) {
+          if (!imageCacheService.isLocalCachedImage(existingTrack.albumArt)) {
+            await existingTrack.update({ albumArt: updatePayload.favoriteSongCover }).catch(() => {});
+          }
+        } else if (updatePayload.favoriteSongTitle && updatePayload.favoriteSongArtist) {
+          await trackRepository.create({
+            spotifyId: updatePayload.favoriteSongSpotifyId,
+            title: updatePayload.favoriteSongTitle,
+            artist: updatePayload.favoriteSongArtist,
+            albumArt: updatePayload.favoriteSongCover,
+            previewUrl: updatePayload.favoriteSongPreviewUrl || null
+          }).catch(() => {});
+        }
       }
 
       const updated = await userRepository.update(id, updatePayload);
@@ -190,8 +281,8 @@ export class ProfileController {
       const user = await userRepository.findById(id);
 
       const tracks = await spotifyService.getUserRecentlyPlayed(
-        user?.accessToken, 
-        limit, 
+        user?.accessToken,
+        limit,
         user?.refreshToken,
         async (refreshed) => {
           if (user?.id && refreshed?.accessToken) {

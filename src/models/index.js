@@ -9,6 +9,7 @@ import { RecentlyPlayed } from './RecentlyPlayed.js';
 import { Friend } from './Friend.js';
 import { SearchCache } from './SearchCache.js';
 import { Notification } from './Notification.js';
+import { YearlyHit } from './YearlyHit.js';
 
 // User & Game relations
 User.hasMany(Game, { foreignKey: 'hostId', as: 'hostedGames' });
@@ -47,6 +48,10 @@ User.hasMany(Notification, { foreignKey: 'userId', as: 'notifications', onDelete
 Notification.belongsTo(User, { foreignKey: 'userId', as: 'recipient' });
 Notification.belongsTo(User, { foreignKey: 'senderId', as: 'sender' });
 
+// YearlyHit <-> Track (One-to-Many)
+YearlyHit.hasMany(Track, { foreignKey: 'yearlyHitId', as: 'tracks', onDelete: 'SET NULL' });
+Track.belongsTo(YearlyHit, { foreignKey: 'yearlyHitId', as: 'yearlyHit' });
+
 export {
   User,
   Track,
@@ -58,7 +63,8 @@ export {
   RecentlyPlayed,
   Friend,
   SearchCache,
-  Notification
+  Notification,
+  YearlyHit
 };
 
 export default {
@@ -72,5 +78,6 @@ export default {
   RecentlyPlayed,
   Friend,
   SearchCache,
-  Notification
+  Notification,
+  YearlyHit
 };
