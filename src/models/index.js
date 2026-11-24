@@ -7,9 +7,18 @@ import { Guess } from './Guess.js';
 import { GameHistory } from './GameHistory.js';
 import { RecentlyPlayed } from './RecentlyPlayed.js';
 import { Friend } from './Friend.js';
+import { Follow } from './Follow.js';
+import { Post } from './Post.js';
+import { PostReaction } from './PostReaction.js';
+import { PostComment } from './PostComment.js';
+import { BlindDropAttempt } from './BlindDropAttempt.js';
+import { ChallengeEntry } from './ChallengeEntry.js';
+import { SavedTrack } from './SavedTrack.js';
 import { SearchCache } from './SearchCache.js';
 import { Notification } from './Notification.js';
 import { YearlyHit } from './YearlyHit.js';
+import { AiContentLog } from './AiContentLog.js';
+import { UserPinnedSong } from './UserPinnedSong.js';
 
 // User & Game relations
 User.hasMany(Game, { foreignKey: 'hostId', as: 'hostedGames' });
@@ -52,6 +61,38 @@ Notification.belongsTo(User, { foreignKey: 'senderId', as: 'sender' });
 YearlyHit.hasMany(Track, { foreignKey: 'yearlyHitId', as: 'tracks', onDelete: 'SET NULL' });
 Track.belongsTo(YearlyHit, { foreignKey: 'yearlyHitId', as: 'yearlyHit' });
 
+// Follows
+User.hasMany(Follow, { foreignKey: 'followerId', as: 'followingLinks', onDelete: 'CASCADE' });
+User.hasMany(Follow, { foreignKey: 'followingId', as: 'followerLinks', onDelete: 'CASCADE' });
+Follow.belongsTo(User, { foreignKey: 'followerId', as: 'follower' });
+Follow.belongsTo(User, { foreignKey: 'followingId', as: 'following' });
+
+// Posts, Reactions, Comments & SavedTracks
+User.hasMany(Post, { foreignKey: 'userId', as: 'posts', onDelete: 'CASCADE' });
+Post.belongsTo(User, { foreignKey: 'userId', as: 'author' });
+
+Post.hasMany(PostReaction, { foreignKey: 'postId', as: 'reactions', onDelete: 'CASCADE' });
+PostReaction.belongsTo(Post, { foreignKey: 'postId', as: 'post' });
+PostReaction.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
+Post.hasMany(PostComment, { foreignKey: 'postId', as: 'comments', onDelete: 'CASCADE' });
+PostComment.belongsTo(Post, { foreignKey: 'postId', as: 'post' });
+PostComment.belongsTo(User, { foreignKey: 'userId', as: 'author' });
+
+Post.hasMany(BlindDropAttempt, { foreignKey: 'postId', as: 'blindDropAttempts', onDelete: 'CASCADE' });
+BlindDropAttempt.belongsTo(Post, { foreignKey: 'postId', as: 'post' });
+BlindDropAttempt.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
+Post.hasMany(ChallengeEntry, { foreignKey: 'postId', as: 'challengeEntries', onDelete: 'CASCADE' });
+ChallengeEntry.belongsTo(Post, { foreignKey: 'postId', as: 'post' });
+ChallengeEntry.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
+User.hasMany(SavedTrack, { foreignKey: 'userId', as: 'savedTracks', onDelete: 'CASCADE' });
+SavedTrack.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
+User.hasMany(UserPinnedSong, { foreignKey: 'userId', as: 'pinnedSongs', onDelete: 'CASCADE' });
+UserPinnedSong.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
 export {
   User,
   Track,
@@ -62,9 +103,18 @@ export {
   GameHistory,
   RecentlyPlayed,
   Friend,
+  Follow,
+  Post,
+  PostReaction,
+  PostComment,
+  BlindDropAttempt,
+  ChallengeEntry,
+  SavedTrack,
   SearchCache,
   Notification,
-  YearlyHit
+  YearlyHit,
+  AiContentLog,
+  UserPinnedSong
 };
 
 export default {
@@ -77,7 +127,16 @@ export default {
   GameHistory,
   RecentlyPlayed,
   Friend,
+  Follow,
+  Post,
+  PostReaction,
+  PostComment,
+  BlindDropAttempt,
+  ChallengeEntry,
+  SavedTrack,
   SearchCache,
   Notification,
-  YearlyHit
+  YearlyHit,
+  AiContentLog,
+  UserPinnedSong
 };

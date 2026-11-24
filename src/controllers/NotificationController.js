@@ -1,6 +1,7 @@
 import { notificationRepository } from '../repositories/NotificationRepository.js';
 import { userRepository } from '../repositories/UserRepository.js';
 import { gameRepository } from '../repositories/GameRepository.js';
+import { followRepository } from '../repositories/FollowRepository.js';
 
 export class NotificationController {
   async getNotifications(req, res) {
@@ -44,6 +45,13 @@ export class NotificationController {
 
       if (!hostUserId || !targetUserId || !roomCode) {
         return res.status(400).json({ error: 'Data undangan tidak lengkap' });
+      }
+
+      const isMutual = await followRepository.isMutual(hostUserId, targetUserId);
+      if (!isMutual) {
+        return res.status(403).json({
+          error: 'Hanya pengguna yang saling follow (Mutual) yang dapat diundang ke Room Multiplayer.'
+        });
       }
 
       const host = await userRepository.findById(hostUserId);

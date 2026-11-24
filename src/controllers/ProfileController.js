@@ -1,8 +1,27 @@
+import jwt from 'jsonwebtoken';
 import { userRepository } from '../repositories/UserRepository.js';
 import { historyRepository } from '../repositories/HistoryRepository.js';
 import { trackRepository } from '../repositories/TrackRepository.js';
+import { followRepository } from '../repositories/FollowRepository.js';
+import { UserPinnedSong } from '../models/index.js';
 import { spotifyService } from '../services/SpotifyService.js';
 import { imageCacheService } from '../services/ImageCacheService.js';
+import { feedService } from '../services/FeedService.js';
+import { tasteService } from '../services/TasteService.js';
+
+const JWT_SECRET = process.env.JWT_SECRET || 'spotinize_super_secret_key_2026';
+
+function extractOptionalViewerId(req) {
+  try {
+    const authHeader = req.headers?.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+    if (!token) return null;
+    const decoded = jwt.verify(token, JWT_SECRET);
+    return decoded?.id || null;
+  } catch {
+    return null;
+  }
+}
 
 function formatSpotifyUrl(url, spotifyId) {
   if (url && url.trim()) {
@@ -64,14 +83,44 @@ export class ProfileController {
       delete cleanUser.refreshToken;
 
       const summary = await historyRepository.getSummary(id);
+      const histories = await historyRepository.getByUser(id, 10);
       cleanUser.guessRate = summary.guessRate;
       cleanUser.winRate = summary.guessRate;
       cleanUser.totalSongsGuessed = summary.totalSongsGuessed;
       cleanUser.totalSongsPlayed = summary.totalSongsPlayed;
 
+      const [pinnedRows, followCounts, spotifyShowcase] = await Promise.all([
+        UserPinnedSong.findAll({
+          where: { userId: id },
+          order: [['position', 'ASC']]
+        }),
+        followRepository.getCounts(id),
+        user.spotifyConnected
+          ? spotifyService.getUserSpotifyShowcase(user, req.query.refreshSpotify === '1').catch(() => null)
+          : Promise.resolve(null)
+      ]);
+
+      const pinnedSongs = pinnedRows.length > 0
+        ? pinnedRows.map(p => p.toJSON())
+        : (cleanUser.favoriteSongTitle ? [{
+            id: 'legacy-fav',
+            position: 1,
+            title: cleanUser.favoriteSongTitle,
+            artist: cleanUser.favoriteSongArtist,
+            coverUrl: cleanUser.favoriteSongCover,
+            spotifyId: cleanUser.favoriteSongSpotifyId || null
+          }] : []);
+
+      const badges = tasteService.computeBadges(cleanUser, summary, histories);
+
       return res.json({
         user: cleanUser,
-        summary
+        summary,
+        pinnedSongs,
+        badges,
+        followersCount: followCounts.followersCount,
+        followingCount: followCounts.followingCount,
+        spotifyShowcase
       });
     } catch (err) {
       return res.status(500).json({ error: err.message });
@@ -96,16 +145,54 @@ export class ProfileController {
       delete cleanUser.refreshToken;
 
       const summary = await historyRepository.getSummary(user.id);
-      const histories = await historyRepository.getByUser(user.id, 5);
+      const histories = await historyRepository.getByUser(user.id, 10);
       cleanUser.guessRate = summary.guessRate;
       cleanUser.winRate = summary.guessRate;
       cleanUser.totalSongsGuessed = summary.totalSongsGuessed;
       cleanUser.totalSongsPlayed = summary.totalSongsPlayed;
 
+      const viewerId = extractOptionalViewerId(req);
+      const [pinnedRows, followCounts, relationship, tasteCompatibility, spotifyShowcase] = await Promise.all([
+        UserPinnedSong.findAll({
+          where: { userId: user.id },
+          order: [['position', 'ASC']]
+        }),
+        followRepository.getCounts(user.id),
+        viewerId && viewerId !== user.id
+          ? followRepository.getRelationship(viewerId, user.id)
+          : Promise.resolve(null),
+        viewerId && viewerId !== user.id
+          ? tasteService.computeCompatibility(viewerId, user.id).catch(() => null)
+          : Promise.resolve(null),
+        user.spotifyConnected
+          ? spotifyService.getUserSpotifyShowcase(user, req.query.refreshSpotify === '1').catch(() => null)
+          : Promise.resolve(null)
+      ]);
+
+      const pinnedSongs = pinnedRows.length > 0
+        ? pinnedRows.map(p => p.toJSON())
+        : (cleanUser.favoriteSongTitle ? [{
+            id: 'legacy-fav',
+            position: 1,
+            title: cleanUser.favoriteSongTitle,
+            artist: cleanUser.favoriteSongArtist,
+            coverUrl: cleanUser.favoriteSongCover,
+            spotifyId: cleanUser.favoriteSongSpotifyId || null
+          }] : []);
+
+      const badges = tasteService.computeBadges(cleanUser, summary, histories);
+
       return res.json({
         user: cleanUser,
         summary,
-        histories
+        histories: histories.slice(0, 5),
+        pinnedSongs,
+        badges,
+        followersCount: followCounts.followersCount,
+        followingCount: followCounts.followingCount,
+        relationship,
+        tasteCompatibility,
+        spotifyShowcase
       });
     } catch (err) {
       return res.status(500).json({ error: err.message });
@@ -236,6 +323,18 @@ export class ProfileController {
         return res.status(404).json({ error: 'User tidak ditemukan' });
       }
 
+      if (updatePayload.favoriteSongTitle) {
+        feedService.createAutoActivity(id, 'pinned_songs', {
+          track: {
+            title: updated.favoriteSongTitle,
+            artist: updated.favoriteSongArtist,
+            coverUrl: updated.favoriteSongCover,
+            previewUrl: updated.favoriteSongPreviewUrl,
+            spotifyId: updated.favoriteSongSpotifyId
+          }
+        }).catch(() => {});
+      }
+
       const cleanUser = updated.toJSON ? updated.toJSON() : { ...updated };
       cleanUser.spotifyUrl = formatSpotifyUrl(cleanUser.spotifyUrl, cleanUser.spotifyId);
       delete cleanUser.password;
@@ -298,6 +397,68 @@ export class ProfileController {
         }
       );
       return res.json({ tracks });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  async updatePinnedSongs(req, res) {
+    try {
+      const { id } = req.params;
+      const viewerId = extractOptionalViewerId(req);
+      if (viewerId && viewerId !== id) {
+        return res.status(403).json({ error: 'Tidak diizinkan mengubah profil pengguna lain' });
+      }
+
+      const rawSongs = Array.isArray(req.body?.songs) ? req.body.songs.slice(0, 5) : [];
+      const user = await userRepository.findById(id);
+      if (!user) return res.status(404).json({ error: 'User tidak ditemukan' });
+
+      await UserPinnedSong.destroy({ where: { userId: id } });
+
+      const created = [];
+      for (let i = 0; i < rawSongs.length; i += 1) {
+        const s = rawSongs[i];
+        if (!s?.title) continue;
+        const rawCover = s.coverUrl || s.albumArt || null;
+        const cachedCover = await imageCacheService.resolveTrackArtwork(
+          { spotifyId: s.spotifyId || s.id, title: s.title, artist: s.artist, albumArt: rawCover },
+          { allowRemoteFallback: true, searchFn: (q) => spotifyService.searchTracks(q, null, 5) }
+        ).catch(() => rawCover);
+
+        const row = await UserPinnedSong.create({
+          userId: id,
+          position: i + 1,
+          trackId: s.trackId || null,
+          title: String(s.title).trim(),
+          artist: String(s.artist || 'Unknown Artist').trim(),
+          coverUrl: cachedCover || rawCover,
+          previewUrl: s.previewUrl || null,
+          spotifyId: s.spotifyId || s.id || null
+        });
+        created.push(row.toJSON());
+      }
+
+      const top = created[0] || null;
+      await userRepository.update(id, {
+        favoriteSongTitle: top ? top.title : null,
+        favoriteSongArtist: top ? top.artist : null,
+        favoriteSongCover: top ? top.coverUrl : null,
+        favoriteSongSpotifyId: top ? top.spotifyId : null
+      });
+
+      if (top) {
+        feedService.createAutoActivity(id, 'favorite_song', {
+          track: {
+            spotifyId: top.spotifyId,
+            title: top.title,
+            artist: top.artist,
+            coverUrl: top.coverUrl
+          }
+        }).catch(() => {});
+      }
+
+      return res.json({ pinnedSongs: created });
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }

@@ -1,13 +1,16 @@
-import { Game, GameRound } from '../models/index.js';
+import { Game, GameRound, ChallengeEntry, Post, User } from '../models/index.js';
 import { gameRepository } from '../repositories/GameRepository.js';
 import { trackRepository } from '../repositories/TrackRepository.js';
 import { userRepository } from '../repositories/UserRepository.js';
 import { historyRepository } from '../repositories/HistoryRepository.js';
+import { notificationRepository } from '../repositories/NotificationRepository.js';
 import { spotifyService } from './SpotifyService.js';
 import { recentlyPlayedService } from './RecentlyPlayedService.js';
 import { revealService } from './RevealService.js';
 import { guessService } from './GuessService.js';
 import { audioService } from './AudioService.js';
+import { streakService } from './StreakService.js';
+import { feedService } from './FeedService.js';
 import { Timer } from '../utils/Timer.js';
 
 export class GameService {
@@ -84,6 +87,49 @@ export class GameService {
     audioService.preloadGameAudio(savedTracks).catch(err => {
       console.warn('[GameService] Background preload notice:', err.message);
     });
+
+    return await this.getGameState(game.id, userId);
+  }
+
+  /**
+   * Creates an Async Challenge Solo Game replaying the exact same track sequence as sourceGameId.
+   */
+  async createChallengeGame(userId, sourceGameId, challengePostId) {
+    const sourceGame = await gameRepository.findById(sourceGameId);
+    if (!sourceGame) {
+      throw new Error('Game sumber tantangan tidak ditemukan');
+    }
+
+    const sourceRounds = [...(sourceGame.rounds || [])].sort((a, b) => a.roundNumber - b.roundNumber);
+    if (sourceRounds.length === 0) {
+      throw new Error('Set lagu tantangan tidak tersedia');
+    }
+
+    const game = await gameRepository.create({
+      mode: 'SOLO',
+      category: sourceGame.category,
+      artistQuery: sourceGame.artistQuery,
+      numberOfSongs: sourceRounds.length,
+      currentRound: 1,
+      status: 'PLAYING',
+      hostId: userId,
+      challengePostId
+    });
+
+    await gameRepository.addPlayer(game.id, userId, true);
+
+    const tracks = [];
+    for (let i = 0; i < sourceRounds.length; i++) {
+      const r = sourceRounds[i];
+      await gameRepository.createRound(game.id, i + 1, r.trackId);
+      if (r.track) tracks.push(r.track);
+    }
+
+    if (tracks.length > 0) {
+      audioService.preloadGameAudio(tracks).catch(err => {
+        console.warn('[GameService] Challenge preload notice:', err.message);
+      });
+    }
 
     return await this.getGameState(game.id, userId);
   }
@@ -450,6 +496,10 @@ export class GameService {
     // Commit Recently Played
     await recentlyPlayedService.commitPlayedTracks([userId], playedTracks, 'SOLO', game.category);
 
+    // Check previous best before updating stats
+    const prevUser = await userRepository.findById(userId);
+    const prevBestScore = prevUser?.bestScore || 0;
+
     // Update User Stats
     await userRepository.updateStats(userId, {
       score: player.score,
@@ -459,6 +509,61 @@ export class GameService {
       totalSongsPlayed: game.numberOfSongs,
       category: game.category
     });
+
+    // Record Daily Streak & Auto-Activity for Personal Best (non-blocking)
+    streakService.recordActivity(userId).catch(() => {});
+    if (player.score > prevBestScore && player.score > 0) {
+      feedService.createAutoActivity(userId, 'personal_best', {
+        score: player.score,
+        category: game.category,
+        gameId
+      }).catch(() => {});
+    }
+
+    // Record Async Challenge entry if this game was launched from a Challenge post
+    if (game.challengePostId) {
+      try {
+        const existingEntry = await ChallengeEntry.findOne({
+          where: { postId: game.challengePostId, userId }
+        });
+
+        if (!existingEntry) {
+          await ChallengeEntry.create({
+            postId: game.challengePostId,
+            userId,
+            gameId,
+            score: player.score,
+            thinkingTime: player.totalThinkingTime
+          });
+        } else if (
+          player.score > existingEntry.score ||
+          (player.score === existingEntry.score && player.totalThinkingTime < existingEntry.thinkingTime)
+        ) {
+          await existingEntry.update({
+            gameId,
+            score: player.score,
+            thinkingTime: player.totalThinkingTime
+          });
+        }
+
+        const challengePost = await Post.findByPk(game.challengePostId);
+        if (challengePost && challengePost.userId !== userId) {
+          const targetScore = challengePost.metadataJson?.targetScore || 0;
+          if (player.score > targetScore && prevUser) {
+            await notificationRepository.create({
+              userId: challengePost.userId,
+              senderId: userId,
+              type: 'CHALLENGE_BEATEN',
+              title: `${prevUser.displayName} mengalahkan skormu!`,
+              message: `${prevUser.displayName} mencetak ${player.score} poin di tantangan ${game.category} (skormu: ${targetScore}).`,
+              data: { postId: challengePost.id, score: player.score }
+            }).catch(() => {});
+          }
+        }
+      } catch (e) {
+        console.warn('[GameService] Challenge entry record notice:', e.message);
+      }
+    }
 
     return await this.getGameState(gameId, userId);
   }
@@ -537,6 +642,9 @@ export class GameService {
       });
 
       // Update User Stats
+      const prevUser = await userRepository.findById(p.userId);
+      const prevBestScore = prevUser?.bestScore || 0;
+
       const recordedInGame = correctCount + wrongCount + skippedCount;
       await userRepository.updateStats(p.userId, {
         score: p.score,
@@ -546,6 +654,24 @@ export class GameService {
         totalSongsPlayed: p.status === 'LEFT' ? recordedInGame : game.numberOfSongs,
         category: game.category
       });
+
+      if (p.status !== 'LEFT') {
+        streakService.recordActivity(p.userId).catch(() => {});
+        if (isWinner && p.score > 0) {
+          feedService.createAutoActivity(p.userId, 'multiplayer_win', {
+            score: p.score,
+            category: game.category,
+            playerCount: players.length,
+            gameId
+          }).catch(() => {});
+        } else if (p.score > prevBestScore && p.score > 0) {
+          feedService.createAutoActivity(p.userId, 'personal_best', {
+            score: p.score,
+            category: game.category,
+            gameId
+          }).catch(() => {});
+        }
+      }
     }
 
     if (activeUserIds.length > 0 && playedTracks.length > 0) {

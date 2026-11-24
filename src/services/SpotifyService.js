@@ -1570,6 +1570,177 @@ export class SpotifyService {
       { spotifyId: 'tr_1980_6', title: 'Never Gonna Give You Up', artist: 'Rick Astley', album: 'Whenever You Need Somebody', category: 'Era & Tahun', subCategory: '1980S' }
     ];
   }
+
+  async _refreshUserOAuthToken(user) {
+    if (!user?.refreshToken || !spotifyConfig.clientId || !spotifyConfig.clientSecret) return null;
+    try {
+      const creds = Buffer.from(`${spotifyConfig.clientId}:${spotifyConfig.clientSecret}`).toString('base64');
+      const params = new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: user.refreshToken
+      });
+      const res = await axios.post('https://accounts.spotify.com/api/token', params.toString(), {
+        headers: {
+          Authorization: `Basic ${creds}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        timeout: 6000
+      });
+      const newAccessToken = res.data?.access_token;
+      if (newAccessToken && typeof user.update === 'function') {
+        await user.update({
+          accessToken: newAccessToken,
+          ...(res.data?.refresh_token ? { refreshToken: res.data.refresh_token } : {})
+        }).catch(() => {});
+      }
+      return newAccessToken || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async _withUserSpotifyToken(user, fn) {
+    if (!user?.spotifyConnected || !user?.accessToken || String(user.accessToken).startsWith('mock_')) {
+      return null;
+    }
+    try {
+      return await fn(user.accessToken);
+    } catch (err) {
+      if (err?.response?.status === 401 && user.refreshToken) {
+        const refreshed = await this._refreshUserOAuthToken(user);
+        if (refreshed) {
+          return await fn(refreshed);
+        }
+      }
+      return null;
+    }
+  }
+
+  async getUserCurrentlyPlaying(user) {
+    if (!user?.id || !user?.spotifyConnected || !user?.accessToken) return null;
+    if (!this._nowPlayingCache) this._nowPlayingCache = new Map();
+
+    const cached = this._nowPlayingCache.get(user.id);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.data;
+    }
+
+    const data = await this._withUserSpotifyToken(user, async (token) => {
+      try {
+        const res = await axios.get('https://api.spotify.com/v1/me/player/currently-played', {
+          headers: { Authorization: `Bearer ${token}` },
+          timeout: 4500
+        }).catch(() => null);
+
+        const cp = res?.data?.item ? res : await axios.get('https://api.spotify.com/v1/me/player/currently-playing', {
+          headers: { Authorization: `Bearer ${token}` },
+          timeout: 4500
+        }).catch(() => null);
+
+        if (cp?.data?.item) {
+          const t = cp.data.item;
+          return {
+            title: t.name,
+            artist: t.artists?.map(a => a.name).join(', ') || 'Unknown Artist',
+            coverUrl: t.album?.images?.[0]?.url || null,
+            spotifyId: t.id,
+            isPlaying: Boolean(cp.data.is_playing)
+          };
+        }
+
+        const recentRes = await axios.get('https://api.spotify.com/v1/me/player/recently-played', {
+          params: { limit: 1 },
+          headers: { Authorization: `Bearer ${token}` },
+          timeout: 4500
+        }).catch(() => null);
+
+        const last = recentRes?.data?.items?.[0];
+        if (last?.track && last.played_at) {
+          const ageMs = Date.now() - new Date(last.played_at).getTime();
+          if (ageMs <= 30 * 60 * 1000) {
+            return {
+              title: last.track.name,
+              artist: last.track.artists?.map(a => a.name).join(', ') || 'Unknown Artist',
+              coverUrl: last.track.album?.images?.[0]?.url || null,
+              spotifyId: last.track.id,
+              isPlaying: false
+            };
+          }
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    });
+
+    this._nowPlayingCache.set(user.id, { data: data || null, expiresAt: Date.now() + 40 * 1000 });
+    return data || null;
+  }
+
+  async getUserSpotifyShowcase(user, forceRefresh = false) {
+    if (!user?.id || !user?.spotifyConnected || !user?.accessToken) return null;
+    if (!this._showcaseCache) this._showcaseCache = new Map();
+
+    const cached = this._showcaseCache.get(user.id);
+    if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
+      return cached.data;
+    }
+
+    const data = await this._withUserSpotifyToken(user, async (token) => {
+      const headers = { Authorization: `Bearer ${token}` };
+      const [topRes, playlistsRes, artistsRes] = await Promise.all([
+        axios.get('https://api.spotify.com/v1/me/top/tracks', {
+          params: { limit: 6, time_range: 'short_term' },
+          headers,
+          timeout: 5500
+        }).catch(() => null),
+        axios.get('https://api.spotify.com/v1/me/playlists', {
+          params: { limit: 6 },
+          headers,
+          timeout: 5500
+        }).catch(() => null),
+        axios.get('https://api.spotify.com/v1/me/following', {
+          params: { type: 'artist', limit: 6 },
+          headers,
+          timeout: 5500
+        }).catch(() => null)
+      ]);
+
+      const topTracks = (topRes?.data?.items || []).map(t => ({
+        spotifyId: t.id,
+        title: t.name,
+        artist: t.artists?.map(a => a.name).join(', ') || 'Unknown Artist',
+        coverUrl: t.album?.images?.[0]?.url || null,
+        previewUrl: t.preview_url || null,
+        spotifyUrl: t.external_urls?.spotify || `https://open.spotify.com/track/${t.id}`
+      }));
+
+      const publicPlaylists = (playlistsRes?.data?.items || [])
+        .filter(p => p && p.public !== false)
+        .slice(0, 6)
+        .map(p => ({
+          id: p.id,
+          name: p.name,
+          coverUrl: p.images?.[0]?.url || null,
+          tracksCount: p.tracks?.total || 0,
+          url: p.external_urls?.spotify || `https://open.spotify.com/playlist/${p.id}`
+        }));
+
+      const followedArtists = (artistsRes?.data?.artists?.items || []).map(a => ({
+        id: a.id,
+        name: a.name,
+        imageUrl: a.images?.[0]?.url || null,
+        url: a.external_urls?.spotify || `https://open.spotify.com/artist/${a.id}`
+      }));
+
+      return { topTracks, publicPlaylists, followedArtists };
+    });
+
+    if (data) {
+      this._showcaseCache.set(user.id, { data, expiresAt: Date.now() + 30 * 60 * 1000 });
+    }
+    return data || null;
+  }
 }
 
 export const spotifyService = new SpotifyService();

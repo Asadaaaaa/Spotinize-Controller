@@ -20,7 +20,7 @@ Notification.init(
       allowNull: true
     },
     type: {
-      type: DataTypes.ENUM('INVITE', 'FRIEND_REQUEST', 'SYSTEM'),
+      type: DataTypes.STRING(40),
       defaultValue: 'INVITE',
       allowNull: false
     },

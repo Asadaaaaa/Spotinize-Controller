@@ -8,7 +8,10 @@ export const spotifyConfig = {
   scopes: [
     'user-read-private',
     'playlist-read-private',
+    'playlist-read-public',
     'user-read-recently-played',
+    'user-read-currently-playing',
+    'user-follow-read',
     'user-top-read',
     'user-library-read'
   ].join(' ')

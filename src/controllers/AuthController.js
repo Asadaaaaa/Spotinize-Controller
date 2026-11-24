@@ -101,6 +101,9 @@ export class AuthController {
           displayName: user.displayName,
           avatarUrl: user.avatarUrl,
           spotifyConnected: !!user.spotifyConnected,
+          currentStreak: user.currentStreak || 0,
+          longestStreak: user.longestStreak || 0,
+          isOfficial: Boolean(user.isOfficial),
           gamesPlayed: user.gamesPlayed || 0,
           bestScore: user.bestScore || 0,
           totalScore: user.totalScore || 0,
@@ -248,6 +251,27 @@ export class AuthController {
       cleanUser.totalSongsPlayed = summary.totalSongsPlayed;
 
       return res.json({ user: cleanUser });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  async disconnectSpotify(req, res) {
+    try {
+      const tokenStr = extractBearerToken(req.headers.authorization);
+      const decoded = tokenStr ? jwt.verify(tokenStr, JWT_SECRET) : null;
+      const targetId = decoded?.id || req.body?.userId;
+      if (!targetId) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      await userRepository.update(targetId, {
+        spotifyConnected: false,
+        accessToken: null,
+        refreshToken: null
+      });
+
+      return res.json({ success: true, spotifyConnected: false });
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }

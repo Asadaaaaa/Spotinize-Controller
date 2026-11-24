@@ -1,4 +1,5 @@
 import { spotifyService } from '../services/SpotifyService.js';
+import { trackDetailService } from '../services/TrackDetailService.js';
 
 export class SpotifyController {
   async searchTracks(req, res) {
@@ -28,6 +29,23 @@ export class SpotifyController {
       return res.json({ tracks });
     } catch (err) {
       return res.status(500).json({ error: err.message });
+    }
+  }
+
+  async getTrackDetail(req, res) {
+    try {
+      const { id, spotifyId, title, artist, coverUrl, previewUrl } = req.query;
+      const detail = await trackDetailService.getTrackDetail({
+        id: id || null,
+        spotifyId: spotifyId || null,
+        title,
+        artist,
+        coverUrl: coverUrl || null,
+        previewUrl: previewUrl || null
+      });
+      return res.json({ track: detail });
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
     }
   }
 }

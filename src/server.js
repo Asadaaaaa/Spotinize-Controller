@@ -6,6 +6,8 @@ import { SocketServer } from './config/socket.js';
 import { reconnectService } from './services/ReconnectService.js';
 import { matchmakingService } from './services/MatchmakingService.js';
 import { gameService } from './services/GameService.js';
+import { officialBotService } from './services/OfficialBotService.js';
+import { aiContentService } from './services/AiContentService.js';
 import './models/index.js'; // initialize associations
 
 dotenv.config();
@@ -19,6 +21,12 @@ async function bootstrap() {
     // 1. Connect & Sync MySQL Database
     await database.connect();
     await database.sync();
+
+    // Ensure @spotinize official account exists & start AI Content Scheduler
+    await officialBotService.ensureOfficialAccount().catch(err => {
+      console.warn('[Bootstrap] Official bot init notice:', err.message);
+    });
+    aiContentService.startScheduler();
 
     // Sweep stale rooms/disconnected players left over from previous restarts
     reconnectService.sweepStaleSessions(matchmakingService, gameService).catch(err => {

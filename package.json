@@ -21,6 +21,7 @@
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.0",
     "mysql2": "^3.23.3",
+    "rss-parser": "^3.13.0",
     "sequelize": "^6.37.5",
     "sequelize-cli": "^6.6.5",
     "socket.io": "^4.8.1",

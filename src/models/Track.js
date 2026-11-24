@@ -61,6 +61,30 @@ Track.init({
   popularity: {
     type: DataTypes.INTEGER,
     defaultValue: 50
+  },
+  releaseDate: {
+    type: DataTypes.STRING(32),
+    allowNull: true
+  },
+  writers: {
+    type: DataTypes.STRING(500),
+    allowNull: true
+  },
+  description: {
+    type: DataTypes.TEXT,
+    allowNull: true
+  },
+  descriptionEn: {
+    type: DataTypes.TEXT,
+    allowNull: true
+  },
+  youtubeVideoId: {
+    type: DataTypes.STRING(32),
+    allowNull: true
+  },
+  detailCachedAt: {
+    type: DataTypes.DATE,
+    allowNull: true
   }
 }, {
   sequelize,

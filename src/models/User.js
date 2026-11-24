@@ -110,6 +110,25 @@ User.init({
   favoriteSongPreviewUrl: {
     type: DataTypes.STRING,
     allowNull: true
+  },
+  isOfficial: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
+    allowNull: false
+  },
+  currentStreak: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    allowNull: false
+  },
+  longestStreak: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    allowNull: false
+  },
+  lastPlayedDate: {
+    type: DataTypes.DATEONLY,
+    allowNull: true
   }
 }, {
   sequelize,

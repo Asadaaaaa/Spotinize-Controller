@@ -51,6 +51,10 @@ Game.init({
     type: DataTypes.UUID,
     allowNull: false
   },
+  challengePostId: {
+    type: DataTypes.UUID,
+    allowNull: true
+  },
   finishedAt: {
     type: DataTypes.DATE,
     allowNull: true

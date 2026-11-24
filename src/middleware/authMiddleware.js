@@ -45,4 +45,26 @@ export function requireAuth(req, res, next) {
   }
 }
 
+/**
+ * Express middleware that attaches req.user if a valid Bearer token is present,
+ * otherwise continues anonymously without failing.
+ */
+export function optionalAuth(req, res, next) {
+  const token = extractBearerToken(req.headers.authorization);
+  if (!token) {
+    req.user = null;
+    req.userId = null;
+    return next();
+  }
+  try {
+    const decoded = verifyJwtToken(token);
+    req.user = { id: decoded.id, username: decoded.username };
+    req.userId = decoded.id;
+  } catch (err) {
+    req.user = null;
+    req.userId = null;
+  }
+  return next();
+}
+
 export default requireAuth;

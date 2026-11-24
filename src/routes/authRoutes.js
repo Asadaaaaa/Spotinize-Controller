@@ -8,6 +8,7 @@ router.post('/login', (req, res) => authController.login(req, res));
 router.get('/spotify/connect', (req, res) => authController.getSpotifyConnectUrl(req, res));
 router.get('/spotify/login', (req, res) => authController.getSpotifyConnectUrl(req, res));
 router.post('/spotify/callback', (req, res) => authController.handleSpotifyCallback(req, res));
+router.post('/spotify/disconnect', (req, res) => authController.disconnectSpotify(req, res));
 router.get('/me', (req, res) => authController.getMe(req, res));
 
 export default router;
