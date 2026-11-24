@@ -617,6 +617,34 @@ export class SpotifyService {
       artists = this.fallbackArtists.filter(a => a.name.toLowerCase().includes(lowerQ)).slice(0, limit);
     }
 
+    // iTunes Search API fallback so any artist returns suggestions + artwork even when Spotify API is rate-limited
+    if (artists.length < limit) {
+      try {
+        const itunesRes = await axios.get('https://itunes.apple.com/search', {
+          params: { term: q, entity: 'song', limit: 18 },
+          timeout: 4500
+        });
+        const seenNames = new Set(artists.map(a => a.name.toLowerCase()));
+        for (const item of itunesRes.data?.results || []) {
+          const name = (item.artistName || '').trim();
+          if (!name) continue;
+          const key = name.toLowerCase();
+          if (seenNames.has(key)) continue;
+          seenNames.add(key);
+          artists.push({
+            id: item.artistId ? `itunes_art_${item.artistId}` : `itunes_art_${artists.length}`,
+            name,
+            image: item.artworkUrl100 ? item.artworkUrl100.replace('100x100', '600x600') : null,
+            genres: item.primaryGenreName ? [item.primaryGenreName] : [],
+            popularity: 70
+          });
+          if (artists.length >= limit) break;
+        }
+      } catch (err) {
+        console.warn('[SpotifyService] iTunes artist fallback notice:', err.message);
+      }
+    }
+
     // Cache artist avatar images locally
     try {
       const enriched = await Promise.all(artists.map(async (art) => {
