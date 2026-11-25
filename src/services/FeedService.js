@@ -11,8 +11,12 @@ import { notificationRepository } from '../repositories/NotificationRepository.j
 import { TrackMatcher } from '../utils/TrackMatcher.js';
 import { streakService } from './StreakService.js';
 import { gameService } from './GameService.js';
+import { cosmeticService } from './CosmeticService.js';
+import { dailyChallengeService } from './DailyChallengeService.js';
+import { questService } from './QuestService.js';
+import { getWibDateString } from '../utils/WibDate.js';
 
-export const ALLOWED_EMOJIS = ['🔥', '🎧', '🤯', '💀', '❤️'];
+export const ALLOWED_EMOJIS = ['❤️', '👍', '👏', '🔥', '👎', '🎧', '🤯', '💀'];
 
 const AUTHOR_ATTRIBUTES = [
   'id',
@@ -20,7 +24,10 @@ const AUTHOR_ATTRIBUTES = [
   'displayName',
   'avatarUrl',
   'isOfficial',
-  'currentStreak'
+  'currentStreak',
+  'level',
+  'equippedFrameId',
+  'equippedTitleId'
 ];
 
 export function buildTrackKey({ spotifyId, title, artist }) {
@@ -86,7 +93,7 @@ export class FeedService {
       .map(p => p.id);
     const challengePostIds = rawPosts.filter(p => p.type === 'challenge').map(p => p.id);
 
-    const [reactions, comments, savedRows, blindAttempts, challengeEntries] = await Promise.all([
+    const [reactions, comments, savedRows, blindAttempts, challengeEntries, viewerCompletedDaily] = await Promise.all([
       PostReaction.findAll({ where: { postId: { [Op.in]: postIds } } }),
       PostComment.findAll({
         where: { postId: { [Op.in]: postIds } },
@@ -109,8 +116,15 @@ export class FeedService {
             include: [{ model: User, as: 'user', attributes: ['id', 'username', 'displayName', 'avatarUrl'] }],
             order: [['score', 'DESC'], ['thinkingTime', 'ASC']]
           })
-        : Promise.resolve([])
+        : Promise.resolve([]),
+      viewerId ? dailyChallengeService.getUserHasCompletedToday(viewerId).catch(() => false) : Promise.resolve(false)
     ]);
+
+    // Batch hydrate authors' Profile Frames & Titles
+    const rawAuthors = rawPosts.map(p => p.author).filter(Boolean);
+    const hydratedAuthors = await cosmeticService.hydrateUsersCosmetics(rawAuthors).catch(() => rawAuthors);
+    const authorCosmeticsMap = new Map(hydratedAuthors.map(a => [a.id, a]));
+    const todayWib = getWibDateString();
 
     const savedKeySet = new Set(savedRows.map(s => s.trackKey));
 
@@ -245,6 +259,22 @@ export class FeedService {
         }))
       } : null;
 
+      const hydratedAuthor = plain.author ? (authorCosmeticsMap.get(plain.author.id) || plain.author) : null;
+      const postText = `${plain.content || ''} ${plain.contentEn || ''}`.toLowerCase();
+      const mentionsTodayDaily = Boolean(
+        !plain.metadataJson?.isDailyAnnouncement &&
+        plain.type !== 'official_ai' &&
+        (
+          plain.metadataJson?.dailyDate === todayWib ||
+          /\bspotinize\s*daily\b|\bdaily\s*#\d+/i.test(postText)
+        )
+      );
+      const isDailySpoilerHidden = Boolean(
+        mentionsTodayDaily &&
+        !isAuthor &&
+        !viewerCompletedDaily
+      );
+
       return {
         id: plain.id,
         userId: plain.userId,
@@ -257,13 +287,17 @@ export class FeedService {
         sourceGameId: plain.sourceGameId,
         metadata: plain.metadataJson || null,
         createdAt: plain.createdAt,
-        author: plain.author ? {
-          id: plain.author.id,
-          username: plain.author.username,
-          displayName: plain.author.displayName,
-          avatarUrl: plain.author.avatarUrl,
-          isOfficial: Boolean(plain.author.isOfficial),
-          currentStreak: plain.author.currentStreak || 0
+        isDailySpoilerHidden,
+        author: hydratedAuthor ? {
+          id: hydratedAuthor.id,
+          username: hydratedAuthor.username,
+          displayName: hydratedAuthor.displayName,
+          avatarUrl: hydratedAuthor.avatarUrl,
+          isOfficial: Boolean(hydratedAuthor.isOfficial),
+          currentStreak: hydratedAuthor.currentStreak || 0,
+          level: hydratedAuthor.level || 1,
+          equippedFrame: hydratedAuthor.equippedFrame || null,
+          equippedTitle: hydratedAuthor.equippedTitle || null
         } : null,
         track: trackObj,
         blindDrop,
@@ -490,7 +524,7 @@ export class FeedService {
     return { deleted: true, postId };
   }
 
-  async toggleReaction(postId, userId, emoji) {
+  async toggleReaction(postId, userId, emoji, io = null) {
     if (!ALLOWED_EMOJIS.includes(emoji)) {
       throw new Error('Emoji reaksi tidak valid');
     }
@@ -498,17 +532,50 @@ export class FeedService {
     const post = await Post.findByPk(postId);
     if (!post) throw new Error('Postingan tidak ditemukan');
 
-    const existing = await PostReaction.findOne({
-      where: { postId, userId, emoji }
+    const userReactions = await PostReaction.findAll({
+      where: { postId, userId }
     });
+    const sameEmojiRow = userReactions.find(r => r.emoji === emoji);
 
     let active = false;
-    if (existing) {
-      await existing.destroy();
+    if (sameEmojiRow) {
+      await PostReaction.destroy({ where: { postId, userId } });
       active = false;
     } else {
+      if (userReactions.length > 0) {
+        await PostReaction.destroy({ where: { postId, userId } });
+      }
       await PostReaction.create({ postId, userId, emoji });
       active = true;
+    }
+
+    // Notify post author when another user reacts
+    if (active && post.userId !== userId) {
+      const actor = await User.findByPk(userId, { attributes: ['id', 'username', 'displayName', 'avatarUrl'] });
+      if (actor) {
+        const notif = await notificationRepository.create({
+          userId: post.userId,
+          senderId: userId,
+          type: 'POST_REACTION',
+          title: `${actor.displayName} bereaksi ${emoji} di postinganmu`,
+          message: post.content ? post.content.slice(0, 120) : 'Memberikan reaksi pada postinganmu.',
+          data: { postId, emoji }
+        }).catch(() => null);
+
+        if (notif && io) {
+          io.to(`user:${post.userId}`).emit('notification:new', {
+            notification: {
+              ...notif.toJSON(),
+              sender: {
+                id: actor.id,
+                username: actor.username,
+                displayName: actor.displayName,
+                avatarUrl: actor.avatarUrl
+              }
+            }
+          });
+        }
+      }
     }
 
     const allReacts = await PostReaction.findAll({ where: { postId } });

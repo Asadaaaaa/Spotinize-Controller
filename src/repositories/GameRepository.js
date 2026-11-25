@@ -12,7 +12,7 @@ export class GameRepository {
         {
           model: GamePlayer,
           as: 'players',
-          include: [{ model: User, as: 'user', attributes: ['id', 'spotifyId', 'displayName', 'avatarUrl'] }]
+          include: [{ model: User, as: 'user', attributes: ['id', 'spotifyId', 'username', 'displayName', 'avatarUrl', 'level', 'equippedFrameId', 'equippedTitleId'] }]
         },
         {
           model: GameRound,
@@ -22,7 +22,7 @@ export class GameRepository {
         {
           model: User,
           as: 'host',
-          attributes: ['id', 'spotifyId', 'displayName', 'avatarUrl']
+          attributes: ['id', 'spotifyId', 'username', 'displayName', 'avatarUrl', 'level', 'equippedFrameId', 'equippedTitleId']
         }
       ],
       order: [[{ model: GameRound, as: 'rounds' }, 'roundNumber', 'ASC']]
@@ -36,7 +36,7 @@ export class GameRepository {
         {
           model: GamePlayer,
           as: 'players',
-          include: [{ model: User, as: 'user', attributes: ['id', 'spotifyId', 'displayName', 'avatarUrl'] }]
+          include: [{ model: User, as: 'user', attributes: ['id', 'spotifyId', 'username', 'displayName', 'avatarUrl', 'level', 'equippedFrameId', 'equippedTitleId'] }]
         },
         {
           model: GameRound,
@@ -46,7 +46,7 @@ export class GameRepository {
         {
           model: User,
           as: 'host',
-          attributes: ['id', 'spotifyId', 'displayName', 'avatarUrl']
+          attributes: ['id', 'spotifyId', 'username', 'displayName', 'avatarUrl', 'level', 'equippedFrameId', 'equippedTitleId']
         }
       ],
       order: [[{ model: GameRound, as: 'rounds' }, 'roundNumber', 'ASC']]
@@ -79,7 +79,7 @@ export class GameRepository {
   async getPlayer(gameId, userId) {
     return await GamePlayer.findOne({
       where: { gameId, userId },
-      include: [{ model: User, as: 'user', attributes: ['id', 'spotifyId', 'displayName', 'avatarUrl'] }]
+      include: [{ model: User, as: 'user', attributes: ['id', 'spotifyId', 'username', 'displayName', 'avatarUrl', 'level', 'equippedFrameId', 'equippedTitleId'] }]
     });
   }
 
@@ -96,7 +96,7 @@ export class GameRepository {
 
     return await GamePlayer.findAll({
       where: { gameId },
-      include: [{ model: User, as: 'user', attributes: ['id', 'spotifyId', 'displayName', 'avatarUrl'] }],
+      include: [{ model: User, as: 'user', attributes: ['id', 'spotifyId', 'username', 'displayName', 'avatarUrl', 'level', 'equippedFrameId', 'equippedTitleId'] }],
       order
     });
   }

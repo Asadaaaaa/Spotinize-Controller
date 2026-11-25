@@ -1,4 +1,5 @@
 import { gameService } from '../services/GameService.js';
+import { speedBuzzService } from '../services/SpeedBuzzService.js';
 import { broadcastGameFinish } from './socketBroadcaster.js';
 
 export class GameSocket {
@@ -138,6 +139,35 @@ export class GameSocket {
         }
       } catch (err) {
         socket.emit('error', { message: err.message });
+      }
+    });
+
+    // ================= SPEED BUZZ REALTIME EVENTS =================
+    socket.on('speedbuzz:client_ready', async ({ gameId } = {}) => {
+      try {
+        if (!requireSocketAuth() || !gameId) return;
+        await speedBuzzService.handleClientReady(this.io, gameId, socket.userId);
+      } catch (err) {
+        socket.emit('error', { message: err.message });
+      }
+    });
+
+    socket.on('speedbuzz:buzz', async ({ gameId } = {}) => {
+      try {
+        if (!requireSocketAuth() || !gameId) return;
+        await speedBuzzService.handleBuzz(this.io, gameId, socket.userId);
+      } catch (err) {
+        socket.emit('speedbuzz:error', { message: err.message });
+      }
+    });
+
+    socket.on('speedbuzz:guess', async ({ gameId, track } = {}) => {
+      try {
+        if (!requireSocketAuth() || !gameId || !track) return;
+        const res = await speedBuzzService.handleBuzzGuess(this.io, gameId, socket.userId, track);
+        socket.emit('speedbuzz:guess_result', res);
+      } catch (err) {
+        socket.emit('speedbuzz:error', { message: err.message });
       }
     });
   }

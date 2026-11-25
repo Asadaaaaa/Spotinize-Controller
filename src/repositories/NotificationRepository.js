@@ -20,7 +20,7 @@ export class NotificationRepository {
         {
           model: User,
           as: 'sender',
-          attributes: ['id', 'displayName', 'avatarUrl', 'spotifyId']
+          attributes: ['id', 'username', 'displayName', 'avatarUrl', 'spotifyId']
         }
       ],
       order: [['createdAt', 'DESC']],

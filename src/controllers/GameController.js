@@ -83,17 +83,32 @@ export class GameController {
   async createMultiplayer(req, res) {
     try {
       const userId = req.user.id;
-      const { category, artistQuery, numberOfSongs } = req.body;
+      const { category, artistQuery, numberOfSongs, gameSubtype } = req.body;
       const game = await matchmakingService.createRoom(userId, {
         category: category || 'Global Trends',
         artistQuery,
-        numberOfSongs: parseInt(numberOfSongs || 5, 10)
+        numberOfSongs: parseInt(numberOfSongs || 5, 10),
+        gameSubtype: gameSubtype || 'CLASSIC'
       });
 
       const gameState = await gameService.getGameState(game.id, userId);
       return res.json(gameState);
     } catch (err) {
       return res.status(500).json({ error: err.message });
+    }
+  }
+
+  async switchTeam(req, res) {
+    try {
+      const userId = req.user.id;
+      const { gameId } = req.params;
+      const { teamId } = req.body;
+
+      const player = await matchmakingService.switchTeam(gameId, userId, teamId);
+      await broadcastLobbyUpdate(req.app?.get('io'), gameId);
+      return res.json({ player });
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
     }
   }
 

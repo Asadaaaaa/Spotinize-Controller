@@ -18,5 +18,6 @@ router.post('/:gameId/skip', requireAuth, (req, res) => gameController.skipRound
 router.post('/:gameId/next', requireAuth, (req, res) => gameController.nextRound(req, res));
 router.post('/:gameId/leave', requireAuth, (req, res) => gameController.leaveGame(req, res));
 router.post('/:gameId/ready', requireAuth, (req, res) => gameController.toggleReady(req, res));
+router.post('/:gameId/team', requireAuth, (req, res) => gameController.switchTeam(req, res));
 
 export default router;

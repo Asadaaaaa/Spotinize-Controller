@@ -1,4 +1,4 @@
-import { Game, GameRound, ChallengeEntry, Post, User } from '../models/index.js';
+import { Game, GameRound, ChallengeEntry, Post, User, GameHistory, DailyAttempt } from '../models/index.js';
 import { gameRepository } from '../repositories/GameRepository.js';
 import { trackRepository } from '../repositories/TrackRepository.js';
 import { userRepository } from '../repositories/UserRepository.js';
@@ -8,9 +8,17 @@ import { spotifyService } from './SpotifyService.js';
 import { recentlyPlayedService } from './RecentlyPlayedService.js';
 import { revealService } from './RevealService.js';
 import { guessService } from './GuessService.js';
+import { scoringService } from './ScoringService.js';
 import { audioService } from './AudioService.js';
 import { streakService } from './StreakService.js';
 import { feedService } from './FeedService.js';
+import { cosmeticService } from './CosmeticService.js';
+import { dailyChallengeService } from './DailyChallengeService.js';
+import { rankedService } from './RankedService.js';
+import { leaderboardService } from './LeaderboardService.js';
+import { progressionService } from './ProgressionService.js';
+import { questService } from './QuestService.js';
+import { rivalryService } from './RivalryService.js';
 import { Timer } from '../utils/Timer.js';
 
 export class GameService {
@@ -167,6 +175,19 @@ export class GameService {
       throw new Error('Semua pemain harus siap (Ready) sebelum game dapat dimulai!');
     }
 
+    if (game.gameSubtype === 'SQUAD_2V2') {
+      const teamA = players.filter(p => p.teamId === 'A');
+      const teamB = players.filter(p => p.teamId === 'B');
+      if (teamA.length === 0 || teamB.length === 0) {
+        throw new Error('Mode 2v2 Squad membutuhkan minimal 1 pemain di Tim A dan Tim B!');
+      }
+    }
+
+    // For ELIMINATION with < 5 players, automatically use SURVIVAL (3 Lives) rules
+    const effectiveSubtype = (game.gameSubtype === 'ELIMINATION' && players.length < 5)
+      ? 'SURVIVAL'
+      : (game.gameSubtype || 'CLASSIC');
+
     // Atomic transition WAITING -> STARTING
     const [affected] = await Game.update(
       { status: 'STARTING' },
@@ -225,6 +246,7 @@ export class GameService {
 
       await gameRepository.update(gameId, {
         status: 'PLAYING',
+        gameSubtype: effectiveSubtype,
         currentRound: 1,
         numberOfSongs: savedTracks.length
       });
@@ -236,6 +258,9 @@ export class GameService {
           currentRound: 1,
           currentRevealLevel: 0.1,
           remainingAttempts: 3,
+          lives: 3,
+          isEliminated: false,
+          buzzLockoutUntil: null,
           status: 'THINKING',
           roundStartedAt: null,
           roundThinkingTime: 0,
@@ -306,6 +331,10 @@ export class GameService {
     const player = await gameRepository.getPlayer(gameId, userId);
     if (!player) throw new Error('Player tidak ditemukan');
 
+    if (player.isEliminated) {
+      throw new Error('Kamu sudah tereliminasi dan berada di mode Spectator.');
+    }
+
     if (player.status === 'GUESSED' || player.status === 'SKIPPED' || player.status === 'LEFT' || player.remainingAttempts <= 0) {
       throw new Error('Round ini sudah selesai untuk kamu');
     }
@@ -345,21 +374,33 @@ export class GameService {
     const newTotalThinkingTime = Math.round((player.totalThinkingTime + thinkingTime) * 100) / 100;
     const newStatus = result.isCorrect ? 'GUESSED' : (result.isRoundOver ? 'WRONG' : 'THINKING');
 
+    let nextLives = player.lives ?? 3;
+    let nextEliminated = !!player.isEliminated;
+    if (game.mode === 'MULTIPLAYER' && game.gameSubtype === 'SURVIVAL' && !result.isCorrect && result.isRoundOver) {
+      nextLives = Math.max(0, nextLives - 1);
+      if (nextLives <= 0) nextEliminated = true;
+    }
+
     await gameRepository.updatePlayer(gameId, userId, {
       score: newScore,
       remainingAttempts: result.remainingAttempts,
       totalThinkingTime: newTotalThinkingTime,
       roundThinkingTime: thinkingTime,
-      status: newStatus
+      status: newStatus,
+      lives: nextLives,
+      isEliminated: nextEliminated
     });
 
-    // If this was the final round and round ended for this player, check if all players are done
-    if (game.mode === 'MULTIPLAYER' && result.isRoundOver && player.currentRound >= game.numberOfSongs) {
-      await this.checkAndFinishMultiplayerGame(gameId);
+    if (game.mode === 'MULTIPLAYER' && result.isRoundOver) {
+      if (nextEliminated || player.currentRound >= game.numberOfSongs || game.gameSubtype === 'ELIMINATION') {
+        await this.checkAndFinishMultiplayerGame(gameId);
+      }
     }
 
     return {
       ...result,
+      lives: nextLives,
+      isEliminated: nextEliminated,
       targetTrack: result.isRoundOver ? round.track : null,
       player: await gameRepository.getPlayer(gameId, userId)
     };
@@ -385,19 +426,32 @@ export class GameService {
     const roundStart = player.roundStartedAt || new Date();
     const thinkingTime = Timer.getElapsedSeconds(roundStart, Date.now());
 
+    let nextLives = player.lives ?? 3;
+    let nextEliminated = !!player.isEliminated;
+    if (game.mode === 'MULTIPLAYER' && game.gameSubtype === 'SURVIVAL') {
+      nextLives = Math.max(0, nextLives - 1);
+      if (nextLives <= 0) nextEliminated = true;
+    }
+
     await gameRepository.updatePlayer(gameId, userId, {
       status: 'SKIPPED',
       remainingAttempts: 0,
       totalThinkingTime: Math.round((player.totalThinkingTime + thinkingTime) * 100) / 100,
-      roundThinkingTime: thinkingTime
+      roundThinkingTime: thinkingTime,
+      lives: nextLives,
+      isEliminated: nextEliminated
     });
 
-    if (game.mode === 'MULTIPLAYER' && player.currentRound >= game.numberOfSongs) {
-      await this.checkAndFinishMultiplayerGame(gameId);
+    if (game.mode === 'MULTIPLAYER') {
+      if (nextEliminated || player.currentRound >= game.numberOfSongs || game.gameSubtype === 'ELIMINATION') {
+        await this.checkAndFinishMultiplayerGame(gameId);
+      }
     }
 
     return {
       isRoundOver: true,
+      lives: nextLives,
+      isEliminated: nextEliminated,
       targetTrack: round.track,
       player: await gameRepository.getPlayer(gameId, userId)
     };
@@ -416,6 +470,10 @@ export class GameService {
 
     const player = await gameRepository.getPlayer(gameId, userId);
     if (!player) throw new Error('Player tidak ditemukan');
+
+    if (player.isEliminated) {
+      return await this.getGameState(gameId, userId);
+    }
 
     if (player.status === 'THINKING') {
       return await this.getGameState(gameId, userId);
@@ -445,84 +503,200 @@ export class GameService {
     return await this.getGameState(gameId, userId);
   }
 
+  async _evaluatePlayerRounds(rounds, userId, playerStatus, playerRound) {
+    let correctCount = 0;
+    let wrongCount = 0;
+    let skippedCount = 0;
+    let totalWrongGuesses = 0;
+    let sniper01Count = 0;
+    let fastGuessesCount = 0;
+
+    for (const r of rounds) {
+      if (playerStatus === 'LEFT' && r.roundNumber > playerRound) continue;
+      const guesses = await gameRepository.getGuessesForRound(r.id, userId);
+      const wrongInRound = guesses.filter(g => !g.isCorrect).length;
+      totalWrongGuesses += wrongInRound;
+
+      const hit = guesses.find(g => g.isCorrect);
+      if (hit) {
+        correctCount++;
+        if (hit.revealLevel <= 0.1) sniper01Count++;
+        if (hit.revealLevel <= 0.5) fastGuessesCount++;
+      } else if (guesses.length >= 3) {
+        wrongCount++;
+      } else if (playerStatus !== 'THINKING' || r.roundNumber < playerRound) {
+        skippedCount++;
+      }
+    }
+
+    return { correctCount, wrongCount, skippedCount, totalWrongGuesses, sniper01Count, fastGuessesCount };
+  }
+
+  async _runPostGameGamification(userId, game, player, stats, { isWinner = false, rank = 1 } = {}) {
+    const gameSubtype = game.gameSubtype || 'CLASSIC';
+    const isOfficialEligible = leaderboardService.isOfficialEligible({
+      mode: game.mode,
+      gameSubtype,
+      category: game.category,
+      numberOfSongs: game.numberOfSongs
+    });
+
+    const perfectBonus = player.status !== 'LEFT'
+      ? scoringService.calculatePerfectRunBonus(stats.correctCount, stats.totalWrongGuesses, game.numberOfSongs)
+      : 0;
+    const perfectRun = perfectBonus > 0;
+    const finalScore = (player.score || 0) + perfectBonus;
+
+    if (perfectBonus > 0) {
+      await gameRepository.updatePlayer(game.id, userId, { score: finalScore });
+    }
+
+    const prevUser = await userRepository.findById(userId);
+    const prevBestScore = prevUser?.bestScore || 0;
+    const prevPowerScore = prevUser?.allTimePowerScore || 0;
+
+    let rpResult = null;
+    if (game.mode === 'SOLO' && gameSubtype === 'RANKED_SOLO') {
+      rpResult = await rankedService.processRankedResult(userId, {
+        score: finalScore,
+        correctCount: stats.correctCount,
+        totalRounds: game.numberOfSongs,
+        perfectRun,
+        seasonId: game.seasonId
+      }).catch(() => null);
+    }
+
+    if (gameSubtype === 'RANKED_ASYNC' && game.rankedDuelId) {
+      await rankedService.finalizeDuelLeg(game.rankedDuelId, userId, finalScore).catch(() => {});
+    }
+
+    let dailyResult = null;
+    if (gameSubtype === 'DAILY') {
+      dailyResult = await dailyChallengeService.finalizeDailyAttempt(game, userId, {
+        score: finalScore,
+        correctCount: stats.correctCount,
+        totalThinkingTime: player.totalThinkingTime
+      }).catch(() => null);
+    }
+
+    let progression = null;
+    if (player.status !== 'LEFT') {
+      progression = await progressionService.awardGameProgression(userId, {
+        category: game.category,
+        gameSubtype,
+        correctCount: stats.correctCount,
+        sniper01Count: stats.sniper01Count,
+        perfectRun,
+        isWin: isWinner
+      }).catch(() => null);
+    }
+
+    await historyRepository.create({
+      userId,
+      gameId: game.id,
+      mode: game.mode,
+      gameSubtype,
+      category: game.category,
+      artistQuery: game.artistQuery,
+      score: finalScore,
+      rank,
+      roundReached: player.currentRound,
+      totalRounds: game.numberOfSongs,
+      correctCount: stats.correctCount,
+      wrongCount: stats.wrongCount,
+      skippedCount: stats.skippedCount,
+      totalThinkingTime: player.totalThinkingTime,
+      status: game.mode === 'MULTIPLAYER'
+        ? (isWinner ? 'WINNER' : (player.status === 'LEFT' ? 'LEFT' : 'COMPLETED'))
+        : 'COMPLETED',
+      isOfficialEligible,
+      perfectRun,
+      xpEarned: progression?.xpEarned || 0,
+      notesEarned: progression?.notesEarned || 0,
+      rpDelta: rpResult?.rpDelta ?? null
+    });
+
+    const recordedInGame = stats.correctCount + stats.wrongCount + stats.skippedCount;
+    await userRepository.updateStats(userId, {
+      score: finalScore,
+      isWin: isWinner,
+      thinkingTime: player.totalThinkingTime,
+      songsGuessed: stats.correctCount,
+      totalSongsPlayed: player.status === 'LEFT' ? recordedInGame : game.numberOfSongs,
+      category: game.category === 'Spotinize Daily' || game.category === 'Solo Ranked' ? null : game.category
+    });
+
+    if (player.status !== 'LEFT') {
+      streakService.recordActivity(userId).catch(() => {});
+      questService.recordGameCompletionQuests(userId, {
+        gameSubtype,
+        mode: game.mode,
+        fastGuessesCount: stats.fastGuessesCount,
+        correctCount: stats.correctCount,
+        totalRounds: game.numberOfSongs
+      }).catch(() => {});
+
+      const newPowerScore = await leaderboardService.recalculateUserPowerScore(userId).catch(() => prevPowerScore);
+      if (newPowerScore > prevPowerScore) {
+        rivalryService.notifyLeaderboardOvertaken(userId, prevPowerScore, newPowerScore).catch(() => {});
+      }
+      if (dailyResult) {
+        rivalryService.notifyDailyBeaten(userId, dailyResult.dailyDate, finalScore, dailyResult.dailyNumber).catch(() => {});
+      }
+
+      if (game.mode === 'MULTIPLAYER' && isWinner && finalScore > 0) {
+        feedService.createAutoActivity(userId, 'multiplayer_win', {
+          score: finalScore,
+          category: game.category,
+          gameId: game.id
+        }).catch(() => {});
+      } else if (finalScore > prevBestScore && finalScore > 0) {
+        feedService.createAutoActivity(userId, 'personal_best', {
+          score: finalScore,
+          category: game.category,
+          gameId: game.id
+        }).catch(() => {});
+      }
+    }
+
+    return {
+      finalScore,
+      perfectRun,
+      perfectBonus,
+      rpResult,
+      dailyResult,
+      progression
+    };
+  }
+
   /**
    * Finishes a Solo game and records stats & history
    */
   async finishSoloGame(gameId, userId) {
-    await gameRepository.update(gameId, {
-      status: 'FINISHED',
-      finishedAt: new Date()
-    });
+    const [affected] = await Game.update(
+      { status: 'FINISHED', finishedAt: new Date() },
+      { where: { id: gameId, status: 'PLAYING' } }
+    );
+
+    if (affected === 0) {
+      return await this.getGameState(gameId, userId);
+    }
 
     const player = await gameRepository.getPlayer(gameId, userId);
     const game = await gameRepository.findById(gameId);
 
     const rounds = [...(game.rounds || [])].sort((a, b) => a.roundNumber - b.roundNumber);
     const playedTracks = rounds.map(r => r.track).filter(Boolean);
+    const stats = await this._evaluatePlayerRounds(rounds, userId, player.status, player.currentRound);
 
-    let correctCount = 0;
-    let wrongCount = 0;
-    let skippedCount = 0;
-
-    for (const r of rounds) {
-      const guesses = await gameRepository.getGuessesForRound(r.id, userId);
-      if (guesses.some(g => g.isCorrect)) {
-        correctCount++;
-      } else if (guesses.length >= 3) {
-        wrongCount++;
-      } else {
-        skippedCount++;
-      }
-    }
-
-    // Record GameHistory
-    await historyRepository.create({
-      userId,
-      gameId,
-      mode: 'SOLO',
-      category: game.category,
-      artistQuery: game.artistQuery,
-      score: player.score,
-      rank: 1,
-      roundReached: game.numberOfSongs,
-      totalRounds: game.numberOfSongs,
-      correctCount,
-      wrongCount,
-      skippedCount,
-      totalThinkingTime: player.totalThinkingTime,
-      status: 'COMPLETED'
-    });
-
-    // Commit Recently Played
     await recentlyPlayedService.commitPlayedTracks([userId], playedTracks, 'SOLO', game.category);
-
-    // Check previous best before updating stats
     const prevUser = await userRepository.findById(userId);
-    const prevBestScore = prevUser?.bestScore || 0;
-
-    // Update User Stats
-    await userRepository.updateStats(userId, {
-      score: player.score,
-      isWin: true,
-      thinkingTime: player.totalThinkingTime,
-      songsGuessed: correctCount,
-      totalSongsPlayed: game.numberOfSongs,
-      category: game.category
-    });
-
-    // Record Daily Streak & Auto-Activity for Personal Best (non-blocking)
-    streakService.recordActivity(userId).catch(() => {});
-    if (player.score > prevBestScore && player.score > 0) {
-      feedService.createAutoActivity(userId, 'personal_best', {
-        score: player.score,
-        category: game.category,
-        gameId
-      }).catch(() => {});
-    }
+    const postGame = await this._runPostGameGamification(userId, game, player, stats, { isWinner: true, rank: 1 });
 
     // Record Async Challenge entry if this game was launched from a Challenge post
     if (game.challengePostId) {
       try {
+        const finalScore = postGame.finalScore;
         const existingEntry = await ChallengeEntry.findOne({
           where: { postId: game.challengePostId, userId }
         });
@@ -532,16 +706,16 @@ export class GameService {
             postId: game.challengePostId,
             userId,
             gameId,
-            score: player.score,
+            score: finalScore,
             thinkingTime: player.totalThinkingTime
           });
         } else if (
-          player.score > existingEntry.score ||
-          (player.score === existingEntry.score && player.totalThinkingTime < existingEntry.thinkingTime)
+          finalScore > existingEntry.score ||
+          (finalScore === existingEntry.score && player.totalThinkingTime < existingEntry.thinkingTime)
         ) {
           await existingEntry.update({
             gameId,
-            score: player.score,
+            score: finalScore,
             thinkingTime: player.totalThinkingTime
           });
         }
@@ -549,14 +723,14 @@ export class GameService {
         const challengePost = await Post.findByPk(game.challengePostId);
         if (challengePost && challengePost.userId !== userId) {
           const targetScore = challengePost.metadataJson?.targetScore || 0;
-          if (player.score > targetScore && prevUser) {
+          if (finalScore > targetScore && prevUser) {
             await notificationRepository.create({
               userId: challengePost.userId,
               senderId: userId,
               type: 'CHALLENGE_BEATEN',
               title: `${prevUser.displayName} mengalahkan skormu!`,
-              message: `${prevUser.displayName} mencetak ${player.score} poin di tantangan ${game.category} (skormu: ${targetScore}).`,
-              data: { postId: challengePost.id, score: player.score }
+              message: `${prevUser.displayName} mencetak ${finalScore} poin di tantangan ${game.category} (skormu: ${targetScore}).`,
+              data: { postId: challengePost.id, score: finalScore }
             }).catch(() => {});
           }
         }
@@ -583,95 +757,58 @@ export class GameService {
 
     const game = await gameRepository.findById(gameId);
     const players = await gameRepository.getPlayersByGame(gameId);
-
-    // Sort ranking: non-LEFT first, then highest score, then lowest totalThinkingTime
-    const sortedPlayers = [...players].sort((a, b) => {
-      const aLeft = a.status === 'LEFT' ? 1 : 0;
-      const bLeft = b.status === 'LEFT' ? 1 : 0;
-      if (aLeft !== bLeft) return aLeft - bLeft;
-      if (b.score !== a.score) return b.score - a.score;
-      return a.totalThinkingTime - b.totalThinkingTime;
-    });
-
     const rounds = [...(game.rounds || [])].sort((a, b) => a.roundNumber - b.roundNumber);
     const playedTracks = rounds.map(r => r.track).filter(Boolean);
-    const activeUserIds = [];
 
-    for (let i = 0; i < sortedPlayers.length; i++) {
-      const p = sortedPlayers[i];
-      const rank = i + 1;
-      const isWinner = rank === 1 && p.status !== 'LEFT';
+    // Pre-calculate stats & apply Perfect Run Bonus before final ranking
+    const playerData = [];
+    for (const p of players) {
+      const stats = await this._evaluatePlayerRounds(rounds, p.userId, p.status, p.currentRound);
+      const perfectBonus = p.status !== 'LEFT'
+        ? scoringService.calculatePerfectRunBonus(stats.correctCount, stats.totalWrongGuesses, game.numberOfSongs)
+        : 0;
+      const effectiveScore = (p.score || 0) + perfectBonus;
+      playerData.push({ player: p, stats, effectiveScore });
+    }
 
-      let correctCount = 0;
-      let wrongCount = 0;
-      let skippedCount = 0;
-
-      for (const r of rounds) {
-        if (p.status === 'LEFT' && r.roundNumber > p.currentRound) continue;
-        const guesses = await gameRepository.getGuessesForRound(r.id, p.userId);
-        if (guesses.some(g => g.isCorrect)) {
-          correctCount++;
-        } else if (guesses.length >= 3) {
-          wrongCount++;
-        } else if (r.roundNumber < p.currentRound || p.status === 'SKIPPED' || p.status !== 'THINKING') {
-          skippedCount++;
+    let winningTeam = null;
+    if (game.gameSubtype === 'SQUAD_2V2') {
+      const teamStats = { A: [], B: [] };
+      for (const item of playerData) {
+        if (item.player.status !== 'LEFT' && (item.player.teamId === 'A' || item.player.teamId === 'B')) {
+          teamStats[item.player.teamId].push(item.effectiveScore);
         }
       }
+      const avgA = teamStats.A.length ? teamStats.A.reduce((a, b) => a + b, 0) / teamStats.A.length : -1;
+      const avgB = teamStats.B.length ? teamStats.B.reduce((a, b) => a + b, 0) / teamStats.B.length : -1;
+      winningTeam = avgA >= avgB ? 'A' : 'B';
+    }
+
+    const sortedPlayers = [...playerData].sort((a, b) => {
+      const aLeft = a.player.status === 'LEFT' ? 1 : 0;
+      const bLeft = b.player.status === 'LEFT' ? 1 : 0;
+      if (aLeft !== bLeft) return aLeft - bLeft;
+      if (game.gameSubtype === 'SURVIVAL' || game.gameSubtype === 'ELIMINATION') {
+        const aElim = a.player.isEliminated ? 1 : 0;
+        const bElim = b.player.isEliminated ? 1 : 0;
+        if (aElim !== bElim) return aElim - bElim;
+      }
+      if (b.effectiveScore !== a.effectiveScore) return b.effectiveScore - a.effectiveScore;
+      return a.player.totalThinkingTime - b.player.totalThinkingTime;
+    });
+
+    const activeUserIds = [];
+    for (let i = 0; i < sortedPlayers.length; i++) {
+      const { player: p, stats } = sortedPlayers[i];
+      const rank = i + 1;
+      const isWinner = game.gameSubtype === 'SQUAD_2V2'
+        ? (p.status !== 'LEFT' && p.teamId === winningTeam)
+        : (rank === 1 && p.status !== 'LEFT' && !p.isEliminated);
 
       await gameRepository.updatePlayer(gameId, p.userId, { rank });
-      if (p.status !== 'LEFT') {
-        activeUserIds.push(p.userId);
-      }
+      if (p.status !== 'LEFT') activeUserIds.push(p.userId);
 
-      // Record history with complete breakdown
-      await historyRepository.create({
-        userId: p.userId,
-        gameId,
-        mode: 'MULTIPLAYER',
-        category: game.category,
-        artistQuery: game.artistQuery,
-        score: p.score,
-        rank,
-        roundReached: p.currentRound,
-        totalRounds: game.numberOfSongs,
-        correctCount,
-        wrongCount,
-        skippedCount,
-        totalThinkingTime: p.totalThinkingTime,
-        status: isWinner ? 'WINNER' : (p.status === 'LEFT' ? 'LEFT' : 'COMPLETED')
-      });
-
-      // Update User Stats
-      const prevUser = await userRepository.findById(p.userId);
-      const prevBestScore = prevUser?.bestScore || 0;
-
-      const recordedInGame = correctCount + wrongCount + skippedCount;
-      await userRepository.updateStats(p.userId, {
-        score: p.score,
-        isWin: isWinner,
-        thinkingTime: p.totalThinkingTime,
-        songsGuessed: correctCount,
-        totalSongsPlayed: p.status === 'LEFT' ? recordedInGame : game.numberOfSongs,
-        category: game.category
-      });
-
-      if (p.status !== 'LEFT') {
-        streakService.recordActivity(p.userId).catch(() => {});
-        if (isWinner && p.score > 0) {
-          feedService.createAutoActivity(p.userId, 'multiplayer_win', {
-            score: p.score,
-            category: game.category,
-            playerCount: players.length,
-            gameId
-          }).catch(() => {});
-        } else if (p.score > prevBestScore && p.score > 0) {
-          feedService.createAutoActivity(p.userId, 'personal_best', {
-            score: p.score,
-            category: game.category,
-            gameId
-          }).catch(() => {});
-        }
-      }
+      await this._runPostGameGamification(p.userId, game, p, stats, { isWinner, rank });
     }
 
     if (activeUserIds.length > 0 && playedTracks.length > 0) {
@@ -696,13 +833,36 @@ export class GameService {
       return await gameRepository.findById(gameId);
     }
 
-    // If only 1 active player left in a multiplayer match, they automatically win!
     if (activePlayers.length === 1 && players.length > 1) {
       return await this.finishMultiplayerGame(gameId);
     }
 
-    // Check if all active players completed all songs
-    const allCompleted = activePlayers.every(p => p.currentRound >= game.numberOfSongs && p.status !== 'THINKING');
+    // Survival / Elimination: check surviving players
+    if (game.gameSubtype === 'SURVIVAL' || game.gameSubtype === 'ELIMINATION') {
+      const survivors = activePlayers.filter(p => !p.isEliminated);
+      if (survivors.length <= 1 && activePlayers.length > 1) {
+        return await this.finishMultiplayerGame(gameId);
+      }
+
+      if (game.gameSubtype === 'ELIMINATION' && survivors.length > 1) {
+        const minRound = Math.min(...survivors.map(p => p.currentRound));
+        const allFinishedMinRound = survivors.every(p => p.currentRound > minRound || p.status !== 'THINKING');
+        if (allFinishedMinRound && minRound < game.numberOfSongs) {
+          // Eliminate lowest-scoring survivor at this stage
+          const candidates = [...survivors].sort((a, b) => a.score - b.score || b.totalThinkingTime - a.totalThinkingTime);
+          const victim = candidates[0];
+          if (victim) {
+            await gameRepository.updatePlayer(gameId, victim.userId, { isEliminated: true, lives: 0 });
+            if (survivors.length - 1 <= 1) {
+              return await this.finishMultiplayerGame(gameId);
+            }
+          }
+        }
+      }
+    }
+
+    const nonEliminated = activePlayers.filter(p => !p.isEliminated);
+    const allCompleted = nonEliminated.length === 0 || nonEliminated.every(p => p.currentRound >= game.numberOfSongs && p.status !== 'THINKING');
     if (allCompleted) {
       return await this.finishMultiplayerGame(gameId);
     }
@@ -739,7 +899,6 @@ export class GameService {
     const player = game.players?.find(p => p.userId === userId) || null;
     const currentRoundObj = rounds.find(r => r.roundNumber === (player ? player.currentRound : game.currentRound));
 
-    // Sanitized track metadata for client during play (hide title & artist until round over)
     const isRoundOver = player ? (player.status === 'GUESSED' || player.status === 'WRONG' || player.status === 'SKIPPED') : false;
 
     let trackInfo = null;
@@ -754,17 +913,24 @@ export class GameService {
       };
     }
 
-    const leaderboard = (game.players || [])
+    const rawLeaderboard = (game.players || [])
       .map(p => ({
         userId: p.userId,
+        username: p.user?.username || null,
         displayName: p.user?.displayName || 'Player',
         avatarUrl: p.user?.avatarUrl || null,
+        level: p.user?.level || 1,
+        equippedFrameId: p.user?.equippedFrameId || null,
+        equippedTitleId: p.user?.equippedTitleId || null,
         score: p.score,
         status: p.status,
         connectionStatus: p.connectionStatus,
         totalThinkingTime: p.totalThinkingTime,
         currentRound: p.currentRound,
         rank: p.rank,
+        lives: p.lives ?? 3,
+        isEliminated: !!p.isEliminated,
+        teamId: p.teamId || null,
         isReady: !!p.isReady,
         isHost: !!p.isHost,
         createdAt: p.createdAt
@@ -780,17 +946,32 @@ export class GameService {
       })
       .map(({ createdAt, ...entry }) => entry);
 
+    const leaderboard = await cosmeticService.hydrateUsersCosmetics(rawLeaderboard).catch(() => rawLeaderboard);
+
+    let teamStandings = null;
+    if (game.gameSubtype === 'SQUAD_2V2') {
+      const teamA = leaderboard.filter(p => p.teamId === 'A' && p.status !== 'LEFT');
+      const teamB = leaderboard.filter(p => p.teamId === 'B' && p.status !== 'LEFT');
+      const sumA = teamA.reduce((s, p) => s + (p.score || 0), 0);
+      const sumB = teamB.reduce((s, p) => s + (p.score || 0), 0);
+      teamStandings = {
+        A: { totalScore: sumA, avgScore: teamA.length ? Math.round(sumA / teamA.length) : 0, count: teamA.length },
+        B: { totalScore: sumB, avgScore: teamB.length ? Math.round(sumB / teamB.length) : 0, count: teamB.length }
+      };
+    }
+
     const isWaitingForOthers = Boolean(
       game.mode === 'MULTIPLAYER' &&
       game.status === 'PLAYING' &&
       player &&
+      !player.isEliminated &&
       player.currentRound >= game.numberOfSongs &&
       player.status !== 'THINKING' &&
       player.status !== 'LEFT'
     );
 
-    // Include complete ordered track list when game is FINISHED (for FinalResultPage & ShareInstagramModal)
     let tracks = [];
+    let v07Summary = null;
     if (game.status === 'FINISHED') {
       tracks = await Promise.all(rounds.map(async (r) => {
         let isCorrect = false;
@@ -816,12 +997,44 @@ export class GameService {
           userResult
         };
       }));
+
+      if (userId) {
+        const [historyRow, dailyAttemptRow, rankedSummary, freshUser] = await Promise.all([
+          GameHistory.findOne({ where: { gameId, userId }, order: [['createdAt', 'DESC']] }),
+          game.gameSubtype === 'DAILY' && game.dailyDate
+            ? DailyAttempt.findOne({ where: { dailyDate: game.dailyDate, userId } })
+            : Promise.resolve(null),
+          game.gameSubtype === 'RANKED_SOLO'
+            ? rankedService.getUserRankedSummary(userId).catch(() => null)
+            : Promise.resolve(null),
+          User.findByPk(userId, { attributes: ['xp', 'level', 'notesBalance', 'gachaTickets'] })
+        ]);
+
+        v07Summary = {
+          gameSubtype: game.gameSubtype || 'CLASSIC',
+          perfectRun: Boolean(historyRow?.perfectRun),
+          xpEarned: historyRow?.xpEarned || 0,
+          notesEarned: historyRow?.notesEarned || 0,
+          rpDelta: historyRow?.rpDelta ?? null,
+          rankedSummary,
+          dailyResult: dailyAttemptRow ? {
+            dailyDate: dailyAttemptRow.dailyDate,
+            emojiGrid: dailyAttemptRow.emojiGrid,
+            score: dailyAttemptRow.score
+          } : null,
+          userLevel: freshUser?.level || 1,
+          levelState: progressionService.computeLevelState(freshUser?.xp || 0),
+          notesBalance: freshUser?.notesBalance || 0
+        };
+      }
     }
 
     return {
       id: game.id,
       roomCode: game.roomCode,
       mode: game.mode,
+      gameSubtype: game.gameSubtype || 'CLASSIC',
+      dailyDate: game.dailyDate || null,
       category: game.category,
       artistQuery: game.artistQuery,
       numberOfSongs: game.numberOfSongs,
@@ -834,6 +1047,9 @@ export class GameService {
         currentRevealLevel: player.currentRevealLevel,
         remainingAttempts: player.remainingAttempts,
         status: player.status,
+        lives: player.lives ?? 3,
+        isEliminated: !!player.isEliminated,
+        teamId: player.teamId || null,
         totalThinkingTime: player.totalThinkingTime,
         roundThinkingTime: player.roundThinkingTime
       } : null,
@@ -841,6 +1057,8 @@ export class GameService {
       gameTrackIds: rounds.map(r => r.trackId).filter(Boolean),
       tracks,
       leaderboard,
+      teamStandings,
+      v07Summary,
       isWaitingForOthers,
       isFinished: game.status === 'FINISHED'
     };

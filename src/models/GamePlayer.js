@@ -68,6 +68,24 @@ GamePlayer.init({
   rank: {
     type: DataTypes.INTEGER,
     allowNull: true
+  },
+  lives: {
+    type: DataTypes.INTEGER,
+    defaultValue: 3,
+    allowNull: false
+  },
+  isEliminated: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
+    allowNull: false
+  },
+  teamId: {
+    type: DataTypes.STRING(16),
+    allowNull: true
+  },
+  buzzLockoutUntil: {
+    type: DataTypes.DATE,
+    allowNull: true
   }
 }, {
   sequelize,

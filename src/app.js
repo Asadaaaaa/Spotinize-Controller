@@ -17,6 +17,12 @@ import spotifyRoutes from './routes/spotifyRoutes.js';
 import audioRoutes from './routes/audioRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
 import deployRoutes from './routes/deployRoutes.js';
+import storeRoutes from './routes/storeRoutes.js';
+import gachaRoutes from './routes/gachaRoutes.js';
+import dailyLoginRoutes from './routes/dailyLoginRoutes.js';
+import dailyRoutes from './routes/dailyRoutes.js';
+import rankedRoutes from './routes/rankedRoutes.js';
+import questRoutes from './routes/questRoutes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -62,6 +68,12 @@ export class App {
     this.app.use('/api/audio', audioRoutes);
     this.app.use('/api/notifications', notificationRoutes);
     this.app.use('/api/deploy', deployRoutes);
+    this.app.use('/api/store', storeRoutes);
+    this.app.use('/api/gacha', gachaRoutes);
+    this.app.use('/api/daily-login', dailyLoginRoutes);
+    this.app.use('/api/daily', dailyRoutes);
+    this.app.use('/api/ranked', rankedRoutes);
+    this.app.use('/api/quests', questRoutes);
 
     // 404 handler
     this.app.use((req, res) => {

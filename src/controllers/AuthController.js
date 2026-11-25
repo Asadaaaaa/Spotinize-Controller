@@ -4,6 +4,8 @@ import { spotifyService } from '../services/SpotifyService.js';
 import { imageCacheService } from '../services/ImageCacheService.js';
 import { userRepository } from '../repositories/UserRepository.js';
 import { historyRepository } from '../repositories/HistoryRepository.js';
+import { cosmeticService } from '../services/CosmeticService.js';
+import { progressionService } from '../services/ProgressionService.js';
 import { JWT_SECRET, extractBearerToken } from '../middleware/authMiddleware.js';
 
 export class AuthController {
@@ -18,15 +20,20 @@ export class AuthController {
         return res.status(400).json({ error: 'Username wajib diisi' });
       }
 
-      if (username.trim().length < 3) {
+      const rawUsername = username.trim();
+      if (rawUsername.length < 3) {
         return res.status(400).json({ error: 'Username minimal 3 karakter' });
+      }
+
+      if (!/^[a-zA-Z0-9_]+$/.test(rawUsername)) {
+        return res.status(400).json({ error: 'Username hanya boleh berisi huruf, angka, dan underscore (_)' });
       }
 
       if (!password || password.length < 4) {
         return res.status(400).json({ error: 'Password minimal 4 karakter' });
       }
 
-      const cleanUsername = username.trim().toLowerCase();
+      const cleanUsername = rawUsername.toLowerCase();
       const existingUser = await userRepository.findByUsername(cleanUsername);
       if (existingUser) {
         return res.status(400).json({ error: 'Username sudah digunakan, pilih username lain' });
@@ -46,7 +53,9 @@ export class AuthController {
         totalScore: 0,
         bestScore: 0,
         averageScore: 0,
-        winRate: 0
+        winRate: 0,
+        notesBalance: 30,
+        gachaTickets: 1
       });
 
       const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
@@ -57,7 +66,16 @@ export class AuthController {
           username: user.username,
           displayName: user.displayName,
           avatarUrl: user.avatarUrl,
-          spotifyConnected: user.spotifyConnected
+          spotifyConnected: user.spotifyConnected,
+          notesBalance: user.notesBalance || 30,
+          gachaTickets: user.gachaTickets || 1,
+          streakFreezes: 0,
+          xp: 0,
+          level: 1,
+          levelState: progressionService.computeLevelState(0),
+          equippedFrame: null,
+          equippedVinyl: null,
+          equippedTitle: null
         },
         token,
         requireSpotifyConnect: false,
@@ -93,6 +111,7 @@ export class AuthController {
 
       const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
       const summary = await historyRepository.getSummary(user.id);
+      const [hydratedUser] = await cosmeticService.hydrateUsersCosmetics([user]);
 
       return res.json({
         user: {
@@ -103,6 +122,18 @@ export class AuthController {
           spotifyConnected: !!user.spotifyConnected,
           currentStreak: user.currentStreak || 0,
           longestStreak: user.longestStreak || 0,
+          streakFreezes: user.streakFreezes || 0,
+          notesBalance: user.notesBalance || 0,
+          gachaTickets: user.gachaTickets || 0,
+          xp: user.xp || 0,
+          level: user.level || 1,
+          levelState: progressionService.computeLevelState(user.xp || 0),
+          equippedFrameId: user.equippedFrameId || null,
+          equippedVinylId: user.equippedVinylId || null,
+          equippedTitleId: user.equippedTitleId || null,
+          equippedFrame: hydratedUser?.equippedFrame || null,
+          equippedVinyl: hydratedUser?.equippedVinyl || null,
+          equippedTitle: hydratedUser?.equippedTitle || null,
           isOfficial: Boolean(user.isOfficial),
           gamesPlayed: user.gamesPlayed || 0,
           bestScore: user.bestScore || 0,
@@ -240,6 +271,7 @@ export class AuthController {
       }
 
       const summary = await historyRepository.getSummary(user.id);
+      const [hydratedUser] = await cosmeticService.hydrateUsersCosmetics([user]);
       const cleanUser = user.toJSON ? user.toJSON() : { ...user };
       delete cleanUser.password;
       delete cleanUser.accessToken;
@@ -249,6 +281,15 @@ export class AuthController {
       cleanUser.winRate = summary.guessRate;
       cleanUser.totalSongsGuessed = summary.totalSongsGuessed;
       cleanUser.totalSongsPlayed = summary.totalSongsPlayed;
+      cleanUser.level = cleanUser.level || 1;
+      cleanUser.xp = cleanUser.xp || 0;
+      cleanUser.levelState = progressionService.computeLevelState(cleanUser.xp);
+      cleanUser.notesBalance = cleanUser.notesBalance || 0;
+      cleanUser.gachaTickets = cleanUser.gachaTickets || 0;
+      cleanUser.streakFreezes = cleanUser.streakFreezes || 0;
+      cleanUser.equippedFrame = hydratedUser?.equippedFrame || null;
+      cleanUser.equippedVinyl = hydratedUser?.equippedVinyl || null;
+      cleanUser.equippedTitle = hydratedUser?.equippedTitle || null;
 
       return res.json({ user: cleanUser });
     } catch (err) {

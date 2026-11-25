@@ -19,6 +19,19 @@ import { Notification } from './Notification.js';
 import { YearlyHit } from './YearlyHit.js';
 import { AiContentLog } from './AiContentLog.js';
 import { UserPinnedSong } from './UserPinnedSong.js';
+import { CosmeticItem } from './CosmeticItem.js';
+import { UserItem } from './UserItem.js';
+import { NotesTransaction } from './NotesTransaction.js';
+import { WeeklyLoginSchedule } from './WeeklyLoginSchedule.js';
+import { DailyLoginClaim } from './DailyLoginClaim.js';
+import { GachaLog } from './GachaLog.js';
+import { DailyChallenge } from './DailyChallenge.js';
+import { DailyAttempt } from './DailyAttempt.js';
+import { RankedSeason } from './RankedSeason.js';
+import { UserRankedProfile } from './UserRankedProfile.js';
+import { RankedDuel } from './RankedDuel.js';
+import { UserCategoryMastery } from './UserCategoryMastery.js';
+import { UserQuest } from './UserQuest.js';
 
 // User & Game relations
 User.hasMany(Game, { foreignKey: 'hostId', as: 'hostedGames' });
@@ -93,6 +106,46 @@ SavedTrack.belongsTo(User, { foreignKey: 'userId', as: 'user' });
 User.hasMany(UserPinnedSong, { foreignKey: 'userId', as: 'pinnedSongs', onDelete: 'CASCADE' });
 UserPinnedSong.belongsTo(User, { foreignKey: 'userId', as: 'user' });
 
+// v0.7 Cosmetics, Economy, Daily Login & Gacha
+User.belongsTo(CosmeticItem, { foreignKey: 'equippedFrameId', as: 'equippedFrame' });
+User.belongsTo(CosmeticItem, { foreignKey: 'equippedVinylId', as: 'equippedVinyl' });
+User.belongsTo(CosmeticItem, { foreignKey: 'equippedTitleId', as: 'equippedTitle' });
+
+User.hasMany(UserItem, { foreignKey: 'userId', as: 'ownedItems', onDelete: 'CASCADE' });
+UserItem.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+CosmeticItem.hasMany(UserItem, { foreignKey: 'itemId', as: 'owners', onDelete: 'CASCADE' });
+UserItem.belongsTo(CosmeticItem, { foreignKey: 'itemId', as: 'item' });
+
+User.hasMany(NotesTransaction, { foreignKey: 'userId', as: 'notesTransactions', onDelete: 'CASCADE' });
+NotesTransaction.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
+User.hasMany(DailyLoginClaim, { foreignKey: 'userId', as: 'dailyLoginClaims', onDelete: 'CASCADE' });
+DailyLoginClaim.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
+User.hasMany(GachaLog, { foreignKey: 'userId', as: 'gachaLogs', onDelete: 'CASCADE' });
+GachaLog.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+GachaLog.belongsTo(CosmeticItem, { foreignKey: 'itemId', as: 'item' });
+
+// v0.7 Daily Challenges & Attempts
+User.hasMany(DailyAttempt, { foreignKey: 'userId', as: 'dailyAttempts', onDelete: 'CASCADE' });
+DailyAttempt.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
+// v0.7 Ranked Seasons, Profiles & Duels
+RankedSeason.hasMany(UserRankedProfile, { foreignKey: 'seasonId', as: 'profiles', onDelete: 'CASCADE' });
+UserRankedProfile.belongsTo(RankedSeason, { foreignKey: 'seasonId', as: 'season' });
+User.hasMany(UserRankedProfile, { foreignKey: 'userId', as: 'rankedProfiles', onDelete: 'CASCADE' });
+UserRankedProfile.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
+RankedDuel.belongsTo(User, { foreignKey: 'challengerId', as: 'challenger' });
+RankedDuel.belongsTo(User, { foreignKey: 'opponentId', as: 'opponent' });
+
+// v0.7 Category Masteries & Quests
+User.hasMany(UserCategoryMastery, { foreignKey: 'userId', as: 'categoryMasteries', onDelete: 'CASCADE' });
+UserCategoryMastery.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
+User.hasMany(UserQuest, { foreignKey: 'userId', as: 'quests', onDelete: 'CASCADE' });
+UserQuest.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
 export {
   User,
   Track,
@@ -114,7 +167,20 @@ export {
   Notification,
   YearlyHit,
   AiContentLog,
-  UserPinnedSong
+  UserPinnedSong,
+  CosmeticItem,
+  UserItem,
+  NotesTransaction,
+  WeeklyLoginSchedule,
+  DailyLoginClaim,
+  GachaLog,
+  DailyChallenge,
+  DailyAttempt,
+  RankedSeason,
+  UserRankedProfile,
+  RankedDuel,
+  UserCategoryMastery,
+  UserQuest
 };
 
 export default {
@@ -138,5 +204,18 @@ export default {
   Notification,
   YearlyHit,
   AiContentLog,
-  UserPinnedSong
+  UserPinnedSong,
+  CosmeticItem,
+  UserItem,
+  NotesTransaction,
+  WeeklyLoginSchedule,
+  DailyLoginClaim,
+  GachaLog,
+  DailyChallenge,
+  DailyAttempt,
+  RankedSeason,
+  UserRankedProfile,
+  RankedDuel,
+  UserCategoryMastery,
+  UserQuest
 };

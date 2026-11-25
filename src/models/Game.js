@@ -58,6 +58,23 @@ Game.init({
   finishedAt: {
     type: DataTypes.DATE,
     allowNull: true
+  },
+  gameSubtype: {
+    type: DataTypes.STRING(32),
+    defaultValue: 'CLASSIC',
+    allowNull: false
+  },
+  dailyDate: {
+    type: DataTypes.DATEONLY,
+    allowNull: true
+  },
+  seasonId: {
+    type: DataTypes.UUID,
+    allowNull: true
+  },
+  rankedDuelId: {
+    type: DataTypes.UUID,
+    allowNull: true
   }
 }, {
   sequelize,

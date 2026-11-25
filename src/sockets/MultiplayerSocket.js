@@ -74,14 +74,28 @@ export class MultiplayerSocket {
       }
     });
 
+    // Player switches team in 2v2 / Squad mode
+    socket.on('player:switch_team', async ({ gameId, teamId } = {}, ack) => {
+      try {
+        if (!requireSocketAuth() || !gameId || !teamId) return;
+        await matchmakingService.switchTeam(gameId, socket.userId, teamId);
+        await broadcastLobbyUpdate(this.io, gameId);
+        if (typeof ack === 'function') ack({ ok: true });
+      } catch (err) {
+        if (typeof ack === 'function') ack({ ok: false, error: err.message });
+        socket.emit('error', { message: err.message });
+      }
+    });
+
     // Host starts multiplayer game (guarded by atomic STARTING lock)
     socket.on('game:start', async ({ gameId } = {}) => {
       try {
         if (!requireSocketAuth() || !gameId) return;
-        await gameService.startMultiplayerGame(gameId, socket.userId);
+        const started = await gameService.startMultiplayerGame(gameId, socket.userId);
         this.io.to(`game:${gameId}`).emit('game:started', {
           gameId,
           status: 'PLAYING',
+          gameSubtype: started?.gameSubtype || 'CLASSIC',
           currentRound: 1
         });
       } catch (err) {

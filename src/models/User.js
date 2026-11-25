@@ -129,6 +129,73 @@ User.init({
   lastPlayedDate: {
     type: DataTypes.DATEONLY,
     allowNull: true
+  },
+  notesBalance: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    allowNull: false
+  },
+  gachaTickets: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    allowNull: false
+  },
+  streakFreezes: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    allowNull: false
+  },
+  xp: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    allowNull: false
+  },
+  level: {
+    type: DataTypes.INTEGER,
+    defaultValue: 1,
+    allowNull: false
+  },
+  equippedFrameId: {
+    type: DataTypes.UUID,
+    allowNull: true
+  },
+  equippedVinylId: {
+    type: DataTypes.UUID,
+    allowNull: true
+  },
+  equippedTitleId: {
+    type: DataTypes.UUID,
+    allowNull: true
+  },
+  gachaPityEpic: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    allowNull: false
+  },
+  gachaPityLegendary: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    allowNull: false
+  },
+  allTimePowerScore: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    allowNull: false
+  },
+  officialGamesCount: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    allowNull: false
+  },
+  officialAvgScore: {
+    type: DataTypes.FLOAT,
+    defaultValue: 0,
+    allowNull: false
+  },
+  dailyPointsTotal: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    allowNull: false
   }
 }, {
   sequelize,

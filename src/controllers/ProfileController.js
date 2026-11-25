@@ -8,6 +8,11 @@ import { spotifyService } from '../services/SpotifyService.js';
 import { imageCacheService } from '../services/ImageCacheService.js';
 import { feedService } from '../services/FeedService.js';
 import { tasteService } from '../services/TasteService.js';
+import { cosmeticService } from '../services/CosmeticService.js';
+import { leaderboardService } from '../services/LeaderboardService.js';
+import { rankedService } from '../services/RankedService.js';
+import { progressionService } from '../services/ProgressionService.js';
+import { rivalryService } from '../services/RivalryService.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'spotinize_super_secret_key_2026';
 
@@ -89,7 +94,7 @@ export class ProfileController {
       cleanUser.totalSongsGuessed = summary.totalSongsGuessed;
       cleanUser.totalSongsPlayed = summary.totalSongsPlayed;
 
-      const [pinnedRows, followCounts, spotifyShowcase] = await Promise.all([
+      const [pinnedRows, followCounts, spotifyShowcase, rankedSummary, masteries, locker, hydratedArr] = await Promise.all([
         UserPinnedSong.findAll({
           where: { userId: id },
           order: [['position', 'ASC']]
@@ -97,8 +102,15 @@ export class ProfileController {
         followRepository.getCounts(id),
         user.spotifyConnected
           ? spotifyService.getUserSpotifyShowcase(user, req.query.refreshSpotify === '1').catch(() => null)
-          : Promise.resolve(null)
+          : Promise.resolve(null),
+        rankedService.getUserRankedSummary(id).catch(() => null),
+        progressionService.getUserMasteries(id).catch(() => []),
+        cosmeticService.getUserInventory(id).catch(() => []),
+        cosmeticService.hydrateUsersCosmetics([cleanUser]).catch(() => [cleanUser])
       ]);
+
+      const hydratedUser = hydratedArr?.[0] || cleanUser;
+      hydratedUser.levelState = progressionService.computeLevelState(hydratedUser.xp || 0);
 
       const pinnedSongs = pinnedRows.length > 0
         ? pinnedRows.map(p => p.toJSON())
@@ -111,13 +123,16 @@ export class ProfileController {
             spotifyId: cleanUser.favoriteSongSpotifyId || null
           }] : []);
 
-      const badges = tasteService.computeBadges(cleanUser, summary, histories);
+      const badges = tasteService.computeBadges(hydratedUser, summary, histories);
 
       return res.json({
-        user: cleanUser,
+        user: hydratedUser,
         summary,
         pinnedSongs,
         badges,
+        rankedSummary,
+        masteries,
+        locker,
         followersCount: followCounts.followersCount,
         followingCount: followCounts.followingCount,
         spotifyShowcase
@@ -152,7 +167,7 @@ export class ProfileController {
       cleanUser.totalSongsPlayed = summary.totalSongsPlayed;
 
       const viewerId = extractOptionalViewerId(req);
-      const [pinnedRows, followCounts, relationship, tasteCompatibility, spotifyShowcase] = await Promise.all([
+      const [pinnedRows, followCounts, relationship, tasteCompatibility, spotifyShowcase, rankedSummary, masteries, locker, headToHead, hydratedArr] = await Promise.all([
         UserPinnedSong.findAll({
           where: { userId: user.id },
           order: [['position', 'ASC']]
@@ -166,8 +181,18 @@ export class ProfileController {
           : Promise.resolve(null),
         user.spotifyConnected
           ? spotifyService.getUserSpotifyShowcase(user, req.query.refreshSpotify === '1').catch(() => null)
-          : Promise.resolve(null)
+          : Promise.resolve(null),
+        rankedService.getUserRankedSummary(user.id).catch(() => null),
+        progressionService.getUserMasteries(user.id).catch(() => []),
+        cosmeticService.getUserInventory(user.id).catch(() => []),
+        viewerId && viewerId !== user.id
+          ? rivalryService.getHeadToHead(viewerId, user.id).catch(() => null)
+          : Promise.resolve(null),
+        cosmeticService.hydrateUsersCosmetics([cleanUser]).catch(() => [cleanUser])
       ]);
+
+      const hydratedUser = hydratedArr?.[0] || cleanUser;
+      hydratedUser.levelState = progressionService.computeLevelState(hydratedUser.xp || 0);
 
       const pinnedSongs = pinnedRows.length > 0
         ? pinnedRows.map(p => p.toJSON())
@@ -180,14 +205,18 @@ export class ProfileController {
             spotifyId: cleanUser.favoriteSongSpotifyId || null
           }] : []);
 
-      const badges = tasteService.computeBadges(cleanUser, summary, histories);
+      const badges = tasteService.computeBadges(hydratedUser, summary, histories);
 
       return res.json({
-        user: cleanUser,
+        user: hydratedUser,
         summary,
         histories: histories.slice(0, 5),
         pinnedSongs,
         badges,
+        rankedSummary,
+        masteries,
+        locker,
+        headToHead,
         followersCount: followCounts.followersCount,
         followingCount: followCounts.followingCount,
         relationship,
@@ -466,9 +495,23 @@ export class ProfileController {
 
   async getLeaderboard(req, res) {
     try {
-      const limit = parseInt(req.query.limit || 20, 10);
-      const leaderboard = await userRepository.getLeaderboard(limit);
-      return res.json({ leaderboard });
+      const limit = Math.min(50, Math.max(5, parseInt(req.query.limit || 25, 10)));
+      const type = String(req.query.type || 'alltime').toLowerCase();
+      const scope = String(req.query.scope || 'global').toLowerCase() === 'friends' ? 'friends' : 'global';
+      const viewerId = extractOptionalViewerId(req);
+
+      let leaderboard = [];
+      if (type === 'daily') {
+        leaderboard = await leaderboardService.getDailyLeaderboard({ scope, viewerId, limit });
+      } else if (type === 'weekly') {
+        leaderboard = await leaderboardService.getWeeklyLeaderboard({ scope, viewerId, limit });
+      } else if (type === 'season' || type === 'ranked') {
+        leaderboard = await leaderboardService.getSeasonLeaderboard({ scope, viewerId, limit });
+      } else {
+        leaderboard = await leaderboardService.getAllTimeLeaderboard({ scope, viewerId, limit });
+      }
+
+      return res.json({ leaderboard, type, scope });
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }

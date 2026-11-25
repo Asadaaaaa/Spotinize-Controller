@@ -2,6 +2,8 @@ import { gameRepository } from '../repositories/GameRepository.js';
 import { reconnectService } from './ReconnectService.js';
 import { gameService } from './GameService.js';
 
+const ALLOWED_MP_SUBTYPES = new Set(['CLASSIC', 'SURVIVAL', 'ELIMINATION', 'SPEED_BUZZ', 'SQUAD_2V2']);
+
 export class MatchmakingService {
   /**
    * Generates a 6-character alphanumeric room code
@@ -15,9 +17,12 @@ export class MatchmakingService {
     return code;
   }
 
-  async createRoom(hostId, { category = 'Global Trends', artistQuery = null, numberOfSongs = 5 }) {
+  async createRoom(hostId, { category = 'Global Trends', artistQuery = null, numberOfSongs = 5, gameSubtype = 'CLASSIC' }) {
+    const cleanSubtype = ALLOWED_MP_SUBTYPES.has(String(gameSubtype || '').toUpperCase())
+      ? String(gameSubtype).toUpperCase()
+      : 'CLASSIC';
+
     let roomCode = this.generateRoomCode();
-    // Check collision
     let existing = await gameRepository.findByRoomCode(roomCode);
     while (existing) {
       roomCode = this.generateRoomCode();
@@ -27,6 +32,7 @@ export class MatchmakingService {
     const game = await gameRepository.create({
       roomCode,
       mode: 'MULTIPLAYER',
+      gameSubtype: cleanSubtype,
       category,
       artistQuery,
       numberOfSongs,
@@ -34,7 +40,11 @@ export class MatchmakingService {
       hostId
     });
 
-    await gameRepository.addPlayer(game.id, hostId, true);
+    const hostPlayer = await gameRepository.addPlayer(game.id, hostId, true);
+    if (cleanSubtype === 'SQUAD_2V2' && hostPlayer) {
+      await hostPlayer.update({ teamId: 'A' });
+    }
+
     return await gameRepository.findById(game.id);
   }
 
@@ -48,7 +58,6 @@ export class MatchmakingService {
       throw new Error('Room game ini sudah selesai.');
     }
 
-    // If player already in game, verify they haven't left and return game
     const existingPlayer = game.players?.find(p => p.userId === userId);
     if (existingPlayer) {
       if (existingPlayer.status === 'LEFT') {
@@ -66,8 +75,30 @@ export class MatchmakingService {
       throw new Error(`Room sudah penuh (maksimal ${maxPlayers} pemain).`);
     }
 
-    await gameRepository.addPlayer(game.id, userId, false);
+    const newPlayer = await gameRepository.addPlayer(game.id, userId, false);
+    if (game.gameSubtype === 'SQUAD_2V2' && newPlayer) {
+      const teamACount = (game.players || []).filter(p => p.teamId === 'A').length;
+      const teamBCount = (game.players || []).filter(p => p.teamId === 'B').length;
+      await newPlayer.update({ teamId: teamBCount < teamACount ? 'B' : 'A' });
+    }
+
     return await gameRepository.findById(game.id);
+  }
+
+  async switchTeam(gameId, userId, teamId) {
+    const game = await gameRepository.findById(gameId);
+    if (!game) throw new Error('Game tidak ditemukan');
+    if (game.status !== 'WAITING') throw new Error('Tim hanya bisa diganti saat di Lobby');
+    if (game.gameSubtype !== 'SQUAD_2V2') throw new Error('Mode ini tidak menggunakan tim');
+
+    const cleanTeam = String(teamId || '').toUpperCase();
+    if (!['A', 'B'].includes(cleanTeam)) {
+      throw new Error('Tim tidak valid (pilih A atau B)');
+    }
+
+    const updated = await gameRepository.updatePlayer(gameId, userId, { teamId: cleanTeam });
+    if (!updated) throw new Error('Player tidak ditemukan');
+    return updated;
   }
 
   async toggleReady(gameId, userId) {
@@ -83,10 +114,9 @@ export class MatchmakingService {
       throw new Error('Host otomatis siap untuk memulai game');
     }
 
-    const updated = await gameRepository.updatePlayer(gameId, userId, {
+    return await gameRepository.updatePlayer(gameId, userId, {
       isReady: !player.isReady
     });
-    return updated;
   }
 
   async leaveRoom(gameId, userId) {
@@ -124,7 +154,6 @@ export class MatchmakingService {
       };
     }
 
-    // PLAYING or STARTING
     await gameRepository.updatePlayer(gameId, userId, {
       status: 'LEFT',
       connectionStatus: 'DISCONNECTED'

@@ -1,19 +1,26 @@
 import { gameRepository } from '../repositories/GameRepository.js';
 import { gameService } from '../services/GameService.js';
 import { reconnectService } from '../services/ReconnectService.js';
+import { cosmeticService } from '../services/CosmeticService.js';
 
 /**
- * Normalizes player objects for lobby:update payloads.
+ * Normalizes player objects for lobby:update payloads with cosmetics.
  */
-export function formatLobbyPlayers(players = []) {
-  return players.map(p => ({
+export async function formatLobbyPlayers(players = []) {
+  const raw = players.map(p => ({
     userId: p.userId,
+    username: p.user?.username || null,
     displayName: p.user?.displayName || 'Player',
     avatarUrl: p.user?.avatarUrl || null,
+    level: p.user?.level || 1,
+    equippedFrameId: p.user?.equippedFrameId || null,
+    equippedTitleId: p.user?.equippedTitleId || null,
+    teamId: p.teamId || null,
     isReady: !!p.isReady,
     isHost: !!p.isHost,
     connectionStatus: p.connectionStatus || 'CONNECTED'
   }));
+  return cosmeticService.hydrateUsersCosmetics(raw).catch(() => raw);
 }
 
 /**
@@ -37,18 +44,20 @@ export function clearRoomSockets(io, gameId) {
 }
 
 /**
- * Emits canonical lobby:update containing players, hostId, and status.
+ * Emits canonical lobby:update containing players, hostId, gameSubtype, and status.
  */
 export async function broadcastLobbyUpdate(io, gameId) {
   if (!io || !gameId) return;
   const game = await gameRepository.findById(gameId);
   if (!game) return;
   const players = await gameRepository.getPlayersByGame(gameId, 'WAITING');
+  const formattedPlayers = await formatLobbyPlayers(players);
   io.to(`game:${gameId}`).emit('lobby:update', {
     gameId,
     hostId: game.hostId,
     status: game.status,
-    players: formatLobbyPlayers(players)
+    gameSubtype: game.gameSubtype || 'CLASSIC',
+    players: formattedPlayers
   });
 }
 

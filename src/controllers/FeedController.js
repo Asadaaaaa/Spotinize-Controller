@@ -53,7 +53,8 @@ export class FeedController {
       const userId = req.user.id;
       const { postId } = req.params;
       const { emoji } = req.body;
-      const result = await feedService.toggleReaction(postId, userId, emoji);
+      const io = req.app?.get('io');
+      const result = await feedService.toggleReaction(postId, userId, emoji, io);
       return res.json(result);
     } catch (err) {
       return res.status(400).json({ error: err.message });

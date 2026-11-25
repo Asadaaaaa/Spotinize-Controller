@@ -8,6 +8,11 @@ import { matchmakingService } from './services/MatchmakingService.js';
 import { gameService } from './services/GameService.js';
 import { officialBotService } from './services/OfficialBotService.js';
 import { aiContentService } from './services/AiContentService.js';
+import { cosmeticService } from './services/CosmeticService.js';
+import { rankedService } from './services/RankedService.js';
+import { dailyLoginService } from './services/DailyLoginService.js';
+import { dailyChallengeService } from './services/DailyChallengeService.js';
+import { leaderboardService } from './services/LeaderboardService.js';
 import './models/index.js'; // initialize associations
 
 dotenv.config();
@@ -22,10 +27,31 @@ async function bootstrap() {
     await database.connect();
     await database.sync();
 
-    // Ensure @spotinize official account exists & start AI Content Scheduler
+    // Ensure @spotinize official account exists & seed v0.7 catalog/daily/season
     await officialBotService.ensureOfficialAccount().catch(err => {
       console.warn('[Bootstrap] Official bot init notice:', err.message);
     });
+    await cosmeticService.seedDefaultCatalog().catch(err => {
+      console.warn('[Bootstrap] Cosmetic catalog seed notice:', err.message);
+    });
+    await rankedService.ensureActiveSeason().catch(err => {
+      console.warn('[Bootstrap] Ranked season init notice:', err.message);
+    });
+    dailyLoginService.ensureWeeklySchedule().catch(err => {
+      console.warn('[Bootstrap] Weekly daily login init notice:', err.message);
+    });
+    dailyChallengeService.ensureTodayChallenge().catch(err => {
+      console.warn('[Bootstrap] Daily challenge init notice:', err.message);
+    });
+    leaderboardService.backfillAllUsersPowerScore().catch(() => {});
+
+    // Check daily/weekly WIB rollovers every 5 minutes
+    setInterval(() => {
+      dailyLoginService.ensureWeeklySchedule().catch(() => {});
+      dailyChallengeService.ensureTodayChallenge().catch(() => {});
+      rankedService.ensureActiveSeason().catch(() => {});
+    }, 5 * 60 * 1000);
+
     aiContentService.startScheduler();
 
     // Sweep stale rooms/disconnected players left over from previous restarts
