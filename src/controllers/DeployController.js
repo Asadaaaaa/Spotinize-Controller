@@ -43,7 +43,7 @@ export class DeployController {
         if (repoName === 'Spotinize-Web') {
           console.log('[CI/CD] 📦 Building Spotinize-Web...');
           const { stdout } = await execPromise(
-            'cd /root/app/spotinize/web && git pull origin main && npm install --prefer-offline && npm run build'
+            'cd /root/app/spotinize/web && git pull origin main && npm install --prefer-offline && SKIP_VERSION_BUMP=1 npm run build'
           );
           console.log('[CI/CD] ✅ Spotinize-Web deployed successfully:\n' + stdout);
         } else if (repoName === 'Spotinize-Controller') {

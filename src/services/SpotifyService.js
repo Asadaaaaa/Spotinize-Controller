@@ -3,6 +3,7 @@ import spotifyConfig from '../config/spotify.js';
 import { SearchCache, Track, YearlyHit } from '../models/index.js';
 import { imageCacheService } from './ImageCacheService.js';
 import { Normalizer } from '../utils/Normalizer.js';
+import { TrackMatcher } from '../utils/TrackMatcher.js';
 
 export class SpotifyService {
   constructor() {
@@ -11,6 +12,8 @@ export class SpotifyService {
     this.fallbackArtists = this._initFallbackArtists();
     this.appToken = null;
     this.appTokenExpiresAt = 0;
+    this.searchMemCache = new Map();
+    this.localTracksCache = { data: [], expiresAt: 0 };
     this.dailyCharts = {
       'Global Trends': { data: [], expiresAt: 0 },
       'Indonesia Trends': { data: [], expiresAt: 0 }
@@ -464,32 +467,202 @@ export class SpotifyService {
    * Searches Spotify catalog with MySQL database query caching and local file image caching.
    * Returns top 5 results.
    */
-  async searchTracks(query, userAccessToken = null, limit = 5) {
+  _normalizeSearchText(str) {
+    if (!str || typeof str !== 'string') return '';
+    return str
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/['’`]/g, '')
+      .replace(/[^\w\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  _scoreSearchCandidate(track, normQuery, queryTokens) {
+    const rawTitle = track.title || '';
+    const rawArtist = track.artist || '';
+    const normTitle = this._normalizeSearchText(rawTitle);
+    const normArtist = this._normalizeSearchText(rawArtist);
+    const baseTitle = this._normalizeSearchText(Normalizer.normalizeTitle(rawTitle));
+    const baseArtist = this._normalizeSearchText(Normalizer.normalizeArtist(rawArtist));
+    const normFull = `${normTitle} ${normArtist}`.trim();
+    const normRevFull = `${normArtist} ${normTitle}`.trim();
+
+    if (!normTitle && !normArtist) return 0;
+
+    let score = 0;
+
+    if (normTitle === normQuery) score += 120;
+    else if (baseTitle && baseTitle === normQuery) score += 110;
+    else if (normTitle.startsWith(normQuery)) score += 75;
+    else if (normFull.startsWith(normQuery) || normRevFull.startsWith(normQuery)) score += 65;
+    else if (normTitle.includes(normQuery)) score += 50;
+
+    if (normArtist === normQuery || baseArtist === normQuery) score += 45;
+    else if (normArtist.startsWith(normQuery)) score += 32;
+    else if (normArtist.includes(normQuery)) score += 20;
+
+    if (queryTokens.length > 0) {
+      const candidateTokens = [...new Set(`${normTitle} ${normArtist}`.split(' ').filter(Boolean))];
+      let matchedCount = 0;
+
+      for (const qt of queryTokens) {
+        if (candidateTokens.includes(qt)) {
+          score += 22;
+          matchedCount++;
+        } else if (candidateTokens.some(ct => ct.startsWith(qt))) {
+          score += 16;
+          matchedCount++;
+        } else if (normFull.includes(qt)) {
+          score += 12;
+          matchedCount++;
+        } else if (qt.length >= 3) {
+          let bestTokenSim = 0;
+          for (const ct of candidateTokens) {
+            if (Math.abs(ct.length - qt.length) > 2) continue;
+            const sim = TrackMatcher._similarity(qt, ct);
+            if (sim > bestTokenSim) bestTokenSim = sim;
+          }
+          if (bestTokenSim >= 0.72) {
+            score += Math.round(bestTokenSim * 18);
+            matchedCount++;
+          }
+        }
+      }
+
+      if (matchedCount === queryTokens.length) {
+        score += 25;
+      }
+    }
+
+    if (normQuery.length >= 3) {
+      const simTitle = TrackMatcher._similarity(normTitle, normQuery);
+      const simBase = baseTitle ? TrackMatcher._similarity(baseTitle, normQuery) : 0;
+      const bestSim = Math.max(simTitle, simBase);
+      if (bestSim >= 0.6) {
+        score += Math.round(bestSim * 55);
+      }
+    }
+
+    if (track.isLocalTrack) {
+      score += 12;
+    }
+
+    const haystack = `${rawTitle} ${track.album || ''}`.toLowerCase();
+    const bannedTerms = [
+      'karaoke', 'sped up', 'slowed', '8-bit', 'ringtone',
+      'lullaby', 'tribute', 'music box', 'instrumental', 'originally performed'
+    ];
+    for (const term of bannedTerms) {
+      if (haystack.includes(term) && !normQuery.includes(term)) {
+        score -= 45;
+      }
+    }
+
+    return score;
+  }
+
+  async _searchLocalTracksElastic(normQuery, queryTokens) {
+    if (!normQuery) return [];
+    const now = Date.now();
+    if (!this.localTracksCache.data.length || now > this.localTracksCache.expiresAt) {
+      try {
+        const rows = await Track.findAll({
+          attributes: ['id', 'spotifyId', 'title', 'artist', 'album', 'albumArt', 'previewUrl', 'durationMs'],
+          limit: 2500
+        });
+        const merged = [];
+        const seen = new Set();
+        for (const r of rows) {
+          const item = {
+            id: r.id,
+            spotifyId: r.spotifyId || `db_${r.id}`,
+            title: r.title,
+            artist: r.artist,
+            primaryArtist: Normalizer.normalizeArtist(r.artist),
+            album: r.album || '',
+            albumArt: r.albumArt || null,
+            previewUrl: r.previewUrl || null,
+            durationMs: r.durationMs || 0,
+            isLocalTrack: true
+          };
+          const key = `${this._normalizeSearchText(item.title)}::${this._normalizeSearchText(item.primaryArtist)}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            merged.push(item);
+          }
+        }
+        for (const fb of this.fallbackTracks) {
+          const key = `${this._normalizeSearchText(fb.title)}::${this._normalizeSearchText(Normalizer.normalizeArtist(fb.artist))}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            merged.push({ ...fb, isLocalTrack: true });
+          }
+        }
+        this.localTracksCache = { data: merged, expiresAt: now + 3 * 60 * 1000 };
+      } catch (err) {
+        this.localTracksCache = { data: this.fallbackTracks.map(f => ({ ...f, isLocalTrack: true })), expiresAt: now + 60 * 1000 };
+      }
+    }
+
+    const hits = [];
+    for (const track of this.localTracksCache.data) {
+      const score = this._scoreSearchCandidate(track, normQuery, queryTokens);
+      if (score >= 28) {
+        hits.push({ ...track, _score: score });
+      }
+    }
+    return hits.sort((a, b) => b._score - a._score).slice(0, 12);
+  }
+
+  _setSearchMemCache(cacheKey, results) {
+    if (this.searchMemCache.size >= 300) {
+      const oldestKey = this.searchMemCache.keys().next().value;
+      if (oldestKey !== undefined) this.searchMemCache.delete(oldestKey);
+    }
+    this.searchMemCache.set(cacheKey, {
+      results,
+      expiresAt: Date.now() + 10 * 60 * 1000
+    });
+  }
+
+  async searchTracks(query, userAccessToken = null, limit = 8) {
     if (!query || query.trim() === '') return [];
 
     const cleanQuery = query.toLowerCase().trim();
-    const effectiveLimit = Math.min(5, parseInt(limit) || 5);
+    const normQuery = this._normalizeSearchText(cleanQuery);
+    const queryTokens = normQuery.split(' ').filter(Boolean);
+    const cacheKey = normQuery || cleanQuery;
+    const effectiveLimit = Math.min(20, Math.max(1, parseInt(limit) || 8));
 
-    // 1. Check MySQL Database Cache first
+    // 1. Layer 1: In-Memory RAM Cache (0ms)
+    const memCached = this.searchMemCache.get(cacheKey);
+    if (memCached && Date.now() < memCached.expiresAt) {
+      return memCached.results.slice(0, effectiveLimit);
+    }
+
+    // 2. Layer 2: MySQL Database Cache (Non-blocking image warm-up)
     try {
       const dbCached = await SearchCache.findOne({
-        where: { query: cleanQuery }
+        where: { query: cacheKey }
       });
 
       if (dbCached && dbCached.results) {
-        // If results exist in DB and not expired, return immediately from database (ensuring images are cached on disk)
         const isExpired = dbCached.expiresAt && new Date(dbCached.expiresAt) < new Date();
         if (!isExpired) {
           const parsed = typeof dbCached.results === 'string' ? JSON.parse(dbCached.results) : dbCached.results;
-          const list = parsed || [];
-          const hasUncachedArt = list.some(t => t.albumArt && !imageCacheService.isLocalCachedImage(t.albumArt));
-          if (!hasUncachedArt) {
+          const list = Array.isArray(parsed) ? parsed : [];
+          if (list.length > 0) {
+            this._setSearchMemCache(cacheKey, list);
+            const hasUncachedArt = list.some(t => t.albumArt && !imageCacheService.isLocalCachedImage(t.albumArt));
+            if (hasUncachedArt) {
+              imageCacheService.bulkCacheImages(list).then((enriched) => {
+                this._setSearchMemCache(cacheKey, enriched);
+                dbCached.update({ results: enriched }).catch(() => {});
+              }).catch(() => {});
+            }
             return list.slice(0, effectiveLimit);
-          }
-          const enriched = await imageCacheService.bulkCacheImages(list);
-          await dbCached.update({ results: enriched }).catch(() => {});
-          if (enriched.some(t => imageCacheService.isLocalCachedImage(t.albumArt))) {
-            return enriched.slice(0, effectiveLimit);
           }
         }
       }
@@ -497,88 +670,133 @@ export class SpotifyService {
       console.warn('[SpotifyService] DB search cache read notice:', err.message);
     }
 
-    let results = [];
+    // 3. Layer 3: Parallel Local Elastic Search + Remote Catalog Fetch (15 candidates)
+    const remotePromise = (async () => {
+      const remoteList = [];
+      const token = (userAccessToken && !userAccessToken.startsWith('mock_'))
+        ? userAccessToken
+        : await this.getAppAccessToken();
 
-    // 2. Try Live Spotify Search via App Token or User Token
-    const token = (userAccessToken && !userAccessToken.startsWith('mock_')) 
-      ? userAccessToken 
-      : await this.getAppAccessToken();
+      if (token) {
+        try {
+          const response = await axios.get('https://api.spotify.com/v1/search', {
+            params: { q: cleanQuery, type: 'track', limit: 15 },
+            headers: { Authorization: `Bearer ${token}` },
+            timeout: 3200
+          });
 
-    if (token) {
-      try {
-        const response = await axios.get('https://api.spotify.com/v1/search', {
-          params: { q: cleanQuery, type: 'track', limit: effectiveLimit },
-          headers: { Authorization: `Bearer ${token}` },
-          timeout: 4000
-        });
-
-        if (response.data?.tracks?.items?.length > 0) {
-          results = response.data.tracks.items.map(item => ({
-            spotifyId: item.id,
-            title: item.name,
-            artist: item.artists.map(a => a.name).join(', '),
-            primaryArtist: item.artists[0]?.name || '',
-            album: item.album.name,
-            albumArt: item.album.images[0]?.url || item.album.images[1]?.url || null,
-            previewUrl: item.preview_url,
-            durationMs: item.duration_ms
-          })).slice(0, effectiveLimit);
+          if (response.data?.tracks?.items?.length > 0) {
+            for (const item of response.data.tracks.items) {
+              remoteList.push({
+                spotifyId: item.id,
+                title: item.name,
+                artist: item.artists.map(a => a.name).join(', '),
+                primaryArtist: item.artists[0]?.name || '',
+                album: item.album.name,
+                albumArt: item.album.images[0]?.url || item.album.images[1]?.url || null,
+                previewUrl: item.preview_url,
+                durationMs: item.duration_ms
+              });
+            }
+          }
+        } catch (err) {
+          console.warn('[SpotifyService] Live Spotify search notice:', err.response?.data?.error?.message || err.message);
         }
-      } catch (err) {
-        console.warn('[SpotifyService] Live Spotify search notice:', err.response?.data?.error?.message || err.message);
+      }
+
+      // Secondary Global Fallback via iTunes Search API if Spotify returned < 4 tracks
+      if (remoteList.length < 4) {
+        try {
+          const itunesRes = await axios.get('https://itunes.apple.com/search', {
+            params: { term: cleanQuery, entity: 'song', limit: 15 },
+            timeout: 2800
+          });
+          if (itunesRes.data?.results?.length > 0) {
+            for (const item of itunesRes.data.results) {
+              remoteList.push({
+                spotifyId: 'itunes_' + item.trackId,
+                title: item.trackName,
+                artist: item.artistName,
+                primaryArtist: item.artistName,
+                album: item.collectionName,
+                albumArt: item.artworkUrl100 ? item.artworkUrl100.replace('100x100bb', '600x600bb') : null,
+                previewUrl: item.previewUrl,
+                durationMs: item.trackTimeMillis
+              });
+            }
+          }
+        } catch (err) {}
+      }
+
+      return remoteList;
+    })();
+
+    const [localHits, remoteHits] = await Promise.all([
+      this._searchLocalTracksElastic(normQuery, queryTokens),
+      remotePromise
+    ]);
+
+    // 4. Score, Deduplicate & Rank All Candidates Elastically
+    const combined = [...remoteHits, ...localHits];
+    const dedupedMap = new Map();
+
+    for (const candidate of combined) {
+      const score = this._scoreSearchCandidate(candidate, normQuery, queryTokens);
+      const baseTitleKey = this._normalizeSearchText(Normalizer.normalizeTitle(candidate.title || ''));
+      const primaryArtistKey = this._normalizeSearchText(
+        candidate.primaryArtist || Normalizer.normalizeArtist(candidate.artist || '')
+      );
+      const dedupKey = `${baseTitleKey}::${primaryArtistKey}`;
+
+      const cleanTrack = {
+        ...(candidate.id ? { id: candidate.id } : {}),
+        spotifyId: candidate.spotifyId,
+        title: candidate.title,
+        artist: candidate.artist,
+        primaryArtist: candidate.primaryArtist || Normalizer.normalizeArtist(candidate.artist || ''),
+        album: candidate.album || '',
+        albumArt: candidate.albumArt || null,
+        previewUrl: candidate.previewUrl || null,
+        durationMs: candidate.durationMs || 0
+      };
+
+      const existing = dedupedMap.get(dedupKey);
+      if (
+        !existing ||
+        score > existing.score ||
+        (score === existing.score && !existing.track.albumArt && cleanTrack.albumArt)
+      ) {
+        dedupedMap.set(dedupKey, { track: cleanTrack, score });
       }
     }
 
-    // 3. Secondary Global Fallback via iTunes Search API if Spotify returns empty
-    if (results.length === 0) {
-      try {
-        const itunesRes = await axios.get('https://itunes.apple.com/search', {
-          params: { term: cleanQuery, entity: 'song', limit: effectiveLimit },
-          timeout: 3000
-        });
-        if (itunesRes.data?.results?.length > 0) {
-          results = itunesRes.data.results.map(item => ({
-            spotifyId: 'itunes_' + item.trackId,
-            title: item.trackName,
-            artist: item.artistName,
-            primaryArtist: item.artistName,
-            album: item.collectionName,
-            albumArt: item.artworkUrl100 ? item.artworkUrl100.replace('100x100bb', '600x600bb') : null,
-            previewUrl: item.previewUrl,
-            durationMs: item.trackTimeMillis
-          })).slice(0, effectiveLimit);
+    const ranked = Array.from(dedupedMap.values())
+      .sort((a, b) => b.score - a.score)
+      .map(entry => entry.track);
+
+    const cachePayload = ranked.slice(0, Math.max(effectiveLimit, 12));
+
+    // 5. Store in RAM cache immediately & warm disk/DB cache in background (NON-BLOCKING)
+    if (cachePayload.length > 0) {
+      this._setSearchMemCache(cacheKey, cachePayload);
+
+      (async () => {
+        try {
+          const enriched = await imageCacheService.bulkCacheImages(cachePayload);
+          this._setSearchMemCache(cacheKey, enriched);
+          const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+          await SearchCache.upsert({
+            query: cacheKey,
+            results: enriched,
+            expiresAt
+          });
+        } catch (err) {
+          console.warn('[SpotifyService] Background search cache notice:', err.message);
         }
-      } catch (err) {}
+      })();
     }
 
-    // 4. Tertiary local fallback catalog
-    if (results.length === 0) {
-      results = this.fallbackTracks.filter(t => 
-        t.title.toLowerCase().includes(cleanQuery) || 
-        t.artist.toLowerCase().includes(cleanQuery)
-      ).slice(0, effectiveLimit);
-    }
-
-    // 5. Cache artwork files locally onto disk
-    try {
-      results = await imageCacheService.bulkCacheImages(results);
-    } catch (err) {
-      console.warn('[SpotifyService] Image caching notice:', err.message);
-    }
-
-    // 6. Save search results into MySQL Database SearchCache table
-    try {
-      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days TTL
-      await SearchCache.upsert({
-        query: cleanQuery,
-        results,
-        expiresAt
-      });
-    } catch (err) {
-      console.warn('[SpotifyService] DB search cache write notice:', err.message);
-    }
-
-    return results;
+    return cachePayload.slice(0, effectiveLimit);
   }
 
   async searchArtists(query, userAccessToken = null, limit = 10) {

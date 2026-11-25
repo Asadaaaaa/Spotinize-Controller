@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { spotifyService } from '../services/SpotifyService.js';
@@ -7,6 +8,8 @@ import { historyRepository } from '../repositories/HistoryRepository.js';
 import { cosmeticService } from '../services/CosmeticService.js';
 import { progressionService } from '../services/ProgressionService.js';
 import { JWT_SECRET, extractBearerToken } from '../middleware/authMiddleware.js';
+import { getWibDateString } from '../utils/WibDate.js';
+import { guestDailyService } from '../services/GuestDailyService.js';
 
 export class AuthController {
   /**
@@ -112,6 +115,8 @@ export class AuthController {
       const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
       const summary = await historyRepository.getSummary(user.id);
       const [hydratedUser] = await cosmeticService.hydrateUsersCosmetics([user]);
+      const todayWib = getWibDateString();
+      const lastPlayedDate = user.lastPlayedDate ? String(user.lastPlayedDate).slice(0, 10) : null;
 
       return res.json({
         user: {
@@ -122,6 +127,9 @@ export class AuthController {
           spotifyConnected: !!user.spotifyConnected,
           currentStreak: user.currentStreak || 0,
           longestStreak: user.longestStreak || 0,
+          lastPlayedDate,
+          streakLitToday: Boolean(lastPlayedDate && lastPlayedDate === todayWib),
+          isGuest: Boolean(String(user.username || '').startsWith('guest_')),
           streakFreezes: user.streakFreezes || 0,
           notesBalance: user.notesBalance || 0,
           gachaTickets: user.gachaTickets || 0,
@@ -287,6 +295,11 @@ export class AuthController {
       cleanUser.notesBalance = cleanUser.notesBalance || 0;
       cleanUser.gachaTickets = cleanUser.gachaTickets || 0;
       cleanUser.streakFreezes = cleanUser.streakFreezes || 0;
+      const todayWib = getWibDateString();
+      const lastPlayedDate = cleanUser.lastPlayedDate ? String(cleanUser.lastPlayedDate).slice(0, 10) : null;
+      cleanUser.lastPlayedDate = lastPlayedDate;
+      cleanUser.streakLitToday = Boolean(lastPlayedDate && lastPlayedDate === todayWib);
+      cleanUser.isGuest = Boolean(String(cleanUser.username || '').startsWith('guest_'));
       cleanUser.equippedFrame = hydratedUser?.equippedFrame || null;
       cleanUser.equippedVinyl = hydratedUser?.equippedVinyl || null;
       cleanUser.equippedTitle = hydratedUser?.equippedTitle || null;
@@ -315,6 +328,47 @@ export class AuthController {
       return res.json({ success: true, spotifyConnected: false });
     } catch (err) {
       return res.status(500).json({ error: err.message });
+    }
+  }
+
+  /**
+   * Issue a stateless Guest Trial Token (NO database user account created)
+   */
+  async guestLogin(req, res) {
+    try {
+      const rawBrowserId = req.body?.browserId || req.headers['x-browser-id'];
+      const browserId = (rawBrowserId && String(rawBrowserId).trim()) || `br_${crypto.randomUUID()}`;
+      const existingToken = req.body?.guestToken || req.headers['x-guest-token'] || null;
+
+      let guestToken = null;
+      if (existingToken) {
+        try {
+          const decoded = jwt.verify(existingToken, JWT_SECRET);
+          if (decoded?.type === 'guest' && decoded?.browserId === browserId) {
+            guestToken = existingToken;
+          }
+        } catch (e) {}
+      }
+
+      if (!guestToken) {
+        guestToken = jwt.sign(
+          { type: 'guest', browserId, nonce: crypto.randomBytes(6).toString('hex') },
+          JWT_SECRET,
+          { expiresIn: '30d' }
+        );
+      }
+
+      const hasPlayedDaily = guestDailyService.hasUsedTrial(browserId, guestToken);
+
+      return res.json({
+        isGuest: true,
+        browserId,
+        guestToken,
+        hasPlayedDaily
+      });
+    } catch (err) {
+      console.error('AuthController guestLogin error:', err);
+      return res.status(500).json({ error: err.message || 'Gagal memulai sesi guest' });
     }
   }
 }

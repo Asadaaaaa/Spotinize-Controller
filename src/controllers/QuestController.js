@@ -3,7 +3,7 @@ import { questService } from '../services/QuestService.js';
 export class QuestController {
   async list(req, res) {
     try {
-      const data = await questService.ensureUserQuests(req.user.id);
+      const data = await questService.ensureUserQuests(req.user?.id || null);
       return res.json(data);
     } catch (err) {
       return res.status(500).json({ error: err.message });

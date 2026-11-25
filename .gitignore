@@ -37,3 +37,6 @@ yarn-error.log*
 .DS_Store
 .vscode
 .idea
+
+# Runtime state
+.guest_daily_trials.json

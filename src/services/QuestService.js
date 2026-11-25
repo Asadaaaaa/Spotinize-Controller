@@ -60,7 +60,28 @@ const WEEKLY_TEMPLATES = [
 
 class QuestService {
   async ensureUserQuests(userId) {
-    if (!userId) return { daily: [], weekly: [] };
+    if (!userId) {
+      const dailyKey = `D:${getWibDateString()}`;
+      const weeklyKey = `W:${getWibWeekKey()}`;
+      return {
+        daily: DAILY_TEMPLATES.map((tpl, idx) => ({
+          id: `guest_${tpl.questCode}`,
+          questType: 'DAILY',
+          periodKey: dailyKey,
+          progress: 0,
+          status: idx === 0 ? 'COMPLETED' : 'ACTIVE',
+          ...tpl
+        })),
+        weekly: WEEKLY_TEMPLATES.map((tpl) => ({
+          id: `guest_${tpl.questCode}`,
+          questType: 'WEEKLY',
+          periodKey: weeklyKey,
+          progress: 0,
+          status: 'ACTIVE',
+          ...tpl
+        }))
+      };
+    }
     const dailyKey = `D:${getWibDateString()}`;
     const weeklyKey = `W:${getWibWeekKey()}`;
 

@@ -1,10 +1,10 @@
 import express from 'express';
 import { storeController } from '../controllers/StoreController.js';
-import { requireAuth } from '../middleware/authMiddleware.js';
+import { requireAuth, optionalAuth } from '../middleware/authMiddleware.js';
 
 const router = express.Router();
 
-router.get('/catalog', requireAuth, (req, res) => storeController.getCatalog(req, res));
+router.get('/catalog', optionalAuth, (req, res) => storeController.getCatalog(req, res));
 router.post('/buy', requireAuth, (req, res) => storeController.buyItem(req, res));
 router.post('/buy-freeze', requireAuth, (req, res) => storeController.buyStreakFreeze(req, res));
 router.post('/buy-ticket', requireAuth, (req, res) => storeController.buyGachaTicket(req, res));

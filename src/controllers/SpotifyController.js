@@ -5,7 +5,7 @@ export class SpotifyController {
   async searchTracks(req, res) {
     try {
       const { q, limit } = req.query;
-      const tracks = await spotifyService.searchTracks(q, null, limit || 5);
+      const tracks = await spotifyService.searchTracks(q, null, Math.min(20, parseInt(limit) || 8));
       return res.json({ tracks });
     } catch (err) {
       return res.status(500).json({ error: err.message });

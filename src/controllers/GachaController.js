@@ -3,7 +3,7 @@ import { gachaService } from '../services/GachaService.js';
 export class GachaController {
   async getInfo(req, res) {
     try {
-      const info = await gachaService.getGachaInfo(req.user.id);
+      const info = await gachaService.getGachaInfo(req.user?.id || null);
       return res.json(info);
     } catch (err) {
       return res.status(500).json({ error: err.message });

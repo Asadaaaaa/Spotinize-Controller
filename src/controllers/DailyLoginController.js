@@ -3,7 +3,7 @@ import { dailyLoginService } from '../services/DailyLoginService.js';
 export class DailyLoginController {
   async getStatus(req, res) {
     try {
-      const status = await dailyLoginService.getStatus(req.user.id);
+      const status = await dailyLoginService.getStatus(req.user?.id || null);
       return res.json(status);
     } catch (err) {
       return res.status(500).json({ error: err.message });

@@ -5,12 +5,14 @@ import { User } from '../models/index.js';
 export class StoreController {
   async getCatalog(req, res) {
     try {
-      const userId = req.user.id;
+      const userId = req.user?.id || null;
       const [items, user] = await Promise.all([
         cosmeticService.getStoreCatalog(userId),
-        User.findByPk(userId, {
-          attributes: ['id', 'notesBalance', 'gachaTickets', 'streakFreezes', 'equippedFrameId', 'equippedVinylId', 'equippedTitleId']
-        })
+        userId
+          ? User.findByPk(userId, {
+              attributes: ['id', 'notesBalance', 'gachaTickets', 'streakFreezes', 'equippedFrameId', 'equippedVinylId', 'equippedTitleId']
+            })
+          : Promise.resolve(null)
       ]);
 
       return res.json({
